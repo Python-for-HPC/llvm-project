@@ -48,6 +48,7 @@ namespace {
       {"DIR.OMP.CRITICAL", OMPD_critical},
       {"DIR.OMP.BARRIER", OMPD_barrier},
       {"DIR.OMP.LOOP", OMPD_for},
+      {"DIR.OMP.PARALLEL.LOOP", OMPD_parallel_for},
   };
 
   static const DenseMap<StringRef, DSAType> StringToDSA = {
@@ -57,6 +58,8 @@ namespace {
   };
 
   using InsertPointTy = OpenMPIRBuilder::InsertPointTy;
+  using BodyGenCallbackTy = OpenMPIRBuilder::BodyGenCallbackTy;
+  using FinalizeCallbackTy = OpenMPIRBuilder::FinalizeCallbackTy;
 
   LoopInfo *LI = nullptr;
   DominatorTree *DT = nullptr;
@@ -64,6 +67,176 @@ namespace {
   struct IntrinsicsOpenMP: public ModulePass {
     static char ID; // Pass identification, replacement for typeid
     IntrinsicsOpenMP() : ModulePass(ID) {}
+
+    static void emitOMPParallel(OpenMPIRBuilder &OMPBuilder,
+                                DenseMap<Value *, DSAType> &DSAValueMap,
+                                const DebugLoc &DL, Function *Fn,
+                                BasicBlock *BBEntry, BasicBlock *AfterBB,
+                                BodyGenCallbackTy BodyGenCB,
+                                FinalizeCallbackTy FiniCB,
+                                Value *IfCondition,
+                                Value *NumThreads) {
+      auto PrivCB = [&](InsertPointTy AllocaIP, InsertPointTy CodeGenIP,
+                        Value &Orig, Value &Inner,
+                        Value *&ReplacementValue) -> InsertPointTy {
+        auto It = DSAValueMap.find(&Orig);
+        dbgs() << "DSAValueMap for Orig " << Orig << " Inner " << Inner;
+        if (It != DSAValueMap.end())
+          dbgs() << It->second;
+        else
+          dbgs() << " (null)!";
+        dbgs() << "\n ";
+
+        assert(It != DSAValueMap.end() && "Expected Value in DSAValueMap");
+
+        if (It->second == DSA_PRIVATE) {
+          OMPBuilder.Builder.restoreIP(AllocaIP);
+          Type *VTy = Inner.getType()->getPointerElementType();
+          ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+              VTy, /*ArraySize */ nullptr, Inner.getName());
+          dbgs() << "Privatizing Inner " << Inner << " -> to -> "
+                 << *ReplacementValue << "\n";
+        } else if (It->second == DSA_FIRSTPRIVATE) {
+          OMPBuilder.Builder.restoreIP(AllocaIP);
+          Type *VTy = Inner.getType()->getPointerElementType();
+          Value *V = OMPBuilder.Builder.CreateLoad(VTy, &Inner,
+                                                   Orig.getName() + ".reload");
+          ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+              VTy, /*ArraySize */ nullptr, Orig.getName() + ".copy");
+          OMPBuilder.Builder.restoreIP(CodeGenIP);
+          OMPBuilder.Builder.CreateStore(V, ReplacementValue);
+          dbgs() << "Firstprivatizing Inner " << Inner << " -> to -> "
+                 << *ReplacementValue << "\n";
+        } else {
+          ReplacementValue = &Inner;
+          dbgs() << "Shared Inner " << Inner << " -> to -> "
+                 << *ReplacementValue << "\n";
+        }
+
+        return CodeGenIP;
+      };
+
+      IRBuilder<>::InsertPoint AllocaIP(
+          &Fn->getEntryBlock(), Fn->getEntryBlock().getFirstInsertionPt());
+
+      // Set the insertion location at the end of the BBEntry.
+      BBEntry->getTerminator()->eraseFromParent();
+
+      Value *IfConditionCast = nullptr;
+      if (IfCondition) {
+        OMPBuilder.Builder.SetInsertPoint(BBEntry);
+        IfConditionCast = OMPBuilder.Builder.CreateIntCast(
+            IfCondition, OMPBuilder.Builder.getInt1Ty(), /* isSigned */ false);
+      }
+
+      OpenMPIRBuilder::LocationDescription Loc(
+          InsertPointTy(BBEntry, BBEntry->end()), DL);
+
+      // TODO: support cancellable, binding.
+      InsertPointTy AfterIP = OMPBuilder.createParallel(
+          Loc, AllocaIP, BodyGenCB, PrivCB, FiniCB,
+          /* IfCondition */ IfConditionCast, /* NumThreads */ NumThreads,
+          OMP_PROC_BIND_default, /* IsCancellable */ false);
+      BranchInst::Create(AfterBB, AfterIP.getBlock());
+    }
+
+    static void emitOMPFor(Module &M, OpenMPIRBuilder &OMPBuilder, Value *IV,
+                           Value *UB, BasicBlock *PreHeader, BasicBlock *Exit,
+                           OMPScheduleType Sched, Value *Chunk) {
+      Type *IVTy = IV->getType()->getPointerElementType();
+
+      auto GetKmpcForStaticInit = [&]() -> FunctionCallee {
+        dbgs() << "Type " << *IVTy << "\n";
+        unsigned Bitwidth = IVTy->getIntegerBitWidth();
+        dbgs() << "Bitwidth " << Bitwidth << "\n";
+        if (Bitwidth == 32)
+          return OMPBuilder.getOrCreateRuntimeFunction(
+              M, OMPRTL___kmpc_for_static_init_4u);
+        if (Bitwidth == 64)
+          return OMPBuilder.getOrCreateRuntimeFunction(
+              M, OMPRTL___kmpc_for_static_init_8u);
+        llvm_unreachable("unknown OpenMP loop iterator bitwidth");
+      };
+      // TODO: privatization.
+      FunctionCallee KmpcForStaticInit = GetKmpcForStaticInit();
+      FunctionCallee KmpcForStaticFini = OMPBuilder.getOrCreateRuntimeFunction(
+          M, OMPRTL___kmpc_for_static_fini);
+
+      const DebugLoc DL = PreHeader->getTerminator()->getDebugLoc();
+      OpenMPIRBuilder::LocationDescription Loc(
+          InsertPointTy(PreHeader, PreHeader->getTerminator()->getIterator()),
+          DL);
+      Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+      Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
+
+      // Create allocas for static init values.
+      InsertPointTy AllocaIP(PreHeader, PreHeader->getFirstInsertionPt());
+      Type *I32Type = Type::getInt32Ty(M.getContext());
+      OMPBuilder.Builder.restoreIP(AllocaIP);
+      Value *PLastIter =
+          OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, "omp_lastiter");
+      Value *PLowerBound =
+          OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_lb");
+      Value *PStride =
+          OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_stride");
+      Value *PUpperBound =
+          OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_ub");
+
+      OMPBuilder.Builder.SetInsertPoint(PreHeader->getTerminator());
+
+      // Store the initial normalized upper bound to PUpperBound.
+      Value *LoadUB = OMPBuilder.Builder.CreateLoad(
+          UB->getType()->getPointerElementType(), UB);
+      OMPBuilder.Builder.CreateStore(LoadUB, PUpperBound);
+
+      Constant *Zero = ConstantInt::get(IVTy, 0);
+      Constant *One = ConstantInt::get(IVTy, 1);
+      OMPBuilder.Builder.CreateStore(Zero, PLowerBound);
+      OMPBuilder.Builder.CreateStore(One, PStride);
+
+      // If Chunk is not specified (nullptr), default to one, complying with the
+      // OpenMP specification.
+      if (!Chunk)
+        Chunk = One;
+      Value *ChunkCast = OMPBuilder.Builder.CreateIntCast(Chunk, IVTy, /*isSigned*/ false);
+
+      Value *ThreadNum = OMPBuilder.getOrCreateThreadID(SrcLoc);
+
+      // TODO: add more scheduling types.
+      Constant *SchedulingType =
+          ConstantInt::get(I32Type, static_cast<int>(Sched));
+
+      dbgs() << "=== SchedulingType " << *SchedulingType << "\n";
+      dbgs() << "=== PLowerBound " << *PLowerBound << "\n";
+      dbgs() << "=== PUpperBound " << *PUpperBound << "\n";
+      dbgs() << "=== PStride " << *PStride << "\n";
+      dbgs() << "=== Incr " << *One << "\n";
+      dbgs() << "=== ChunkCast " << *ChunkCast << "\n";
+      OMPBuilder.Builder.CreateCall(
+          KmpcForStaticInit, {SrcLoc, ThreadNum, SchedulingType, PLastIter,
+                              PLowerBound, PUpperBound, PStride, One, ChunkCast});
+      // Load returned upper bound to UB.
+      Value *LoadPUpperBound = OMPBuilder.Builder.CreateLoad(
+          PUpperBound->getType()->getPointerElementType(), PUpperBound);
+      OMPBuilder.Builder.CreateStore(LoadPUpperBound, UB);
+      // Add lower bound to IV.
+      Value *LowerBound = OMPBuilder.Builder.CreateLoad(IVTy, PLowerBound);
+      Value *LoadIV = OMPBuilder.Builder.CreateLoad(IVTy, IV);
+      Value *UpdateIV = OMPBuilder.Builder.CreateAdd(LoadIV, LowerBound);
+      OMPBuilder.Builder.CreateStore(UpdateIV, IV);
+
+      // Add fini call to loop exit block.
+      OMPBuilder.Builder.SetInsertPoint(Exit->getTerminator());
+      OMPBuilder.Builder.CreateCall(KmpcForStaticFini, {SrcLoc, ThreadNum});
+
+      // Create barrier in exit block.
+      // TODO: only create if not in a combined parallel for directive.
+      OMPBuilder.createBarrier(OpenMPIRBuilder::LocationDescription(
+                                   OMPBuilder.Builder.saveIP(), Loc.DL),
+                               omp::Directive::OMPD_for,
+                               /* ForceSimpleCall */ false,
+                               /* CheckCancelFlag */ false);
+    }
 
     bool runOnModule(Module &M) override {
       dbgs() << "=== Start IntrinsicsOpenMPPass v4\n";
@@ -94,6 +267,20 @@ namespace {
         Directive Dir = OMPD_unknown;
         SmallVector<OperandBundleDef, 16> OpBundles;
         DenseMap<Value *, DSAType>  DSAValueMap;
+
+        struct {
+          Value *IV = nullptr;
+          Value *UB = nullptr;
+          // Implementation defined: set default schedule to static.
+          OMPScheduleType Sched = OMPScheduleType::Static;
+          Value *Chunk = nullptr;
+        } OMPLoopInfo;
+
+        struct {
+          Value *NumThreads = nullptr;
+          Value *IfCondition = nullptr;
+        } ParRegionInfo;
+
         CBEntry->getOperandBundlesAsDefs(OpBundles);
         // TODO: parse clauses.
         for(OperandBundleDef &O : OpBundles) {
@@ -108,9 +295,45 @@ namespace {
             for (auto I = O.input_begin(), E = O.input_end(); I != E; ++I) {
               Value *V = dyn_cast<Value>(*I);
               assert(V && "Expected Value");
-              auto It = StringToDSA.find(Tag);
-              assert(It != StringToDSA.end() && "DSA type not found in map");
-              DSAValueMap[V] = It->second;
+
+              if (Tag.startswith("QUAL.OMP.NORMALIZED.IV")) {
+                assert(O.input_size() == 1 && "Expected single IV value");
+                OMPLoopInfo.IV = V;
+              }
+              else if (Tag.startswith("QUAL.OMP.NORMALIZED.UB")) {
+                assert(O.input_size() == 1 && "Expected single UB value");
+                OMPLoopInfo.UB = V;
+              }
+              else if (Tag.startswith("QUAL.OMP.NUM_THREADS")) {
+                assert(O.input_size() == 1 && "Expected single NumThreads value");
+                ParRegionInfo.NumThreads = V;
+                // TODO: Check DSA value for NumThreads value.
+                DSAValueMap[V] = DSA_FIRSTPRIVATE;
+              }
+              else if (Tag.startswith("QUAL.OMP.SCHEDULE")) {
+                assert(O.input_size() == 1 && "Expected single chunking scheduling value");
+                Constant *Zero = ConstantInt::get(V->getType(), 0);
+                OMPLoopInfo.Chunk = V;
+
+                if (Tag == "QUAL.OMP.SCHEDULE.STATIC") {
+                  assert(V == Zero && "Chunking is not yet supported, requires "
+                                      "the use of omp_stride (static_chunked)");
+                  if (V == Zero)
+                    OMPLoopInfo.Sched = OMPScheduleType::Static;
+                  else
+                    OMPLoopInfo.Sched = OMPScheduleType::StaticChunked;
+                } else
+                  assert(false && "Unsupported scheduling type");
+              }
+              else if (Tag.startswith("QUAL.OMP.IF")) {
+                assert(O.input_size() == 1 && "Expected single if condition value");
+                ParRegionInfo.IfCondition = V;
+              }
+              else /* DSA Qualifiers */ {
+                auto It = StringToDSA.find(Tag);
+                assert(It != StringToDSA.end() && "DSA type not found in map");
+                DSAValueMap[V] = It->second;
+              }
             }
           }
         }
@@ -137,7 +360,7 @@ namespace {
         BasicBlock *BBExit = CBExit->getParent();
         BasicBlock *EndBB = SplitBlock(BBExit, CBExit->getNextNode(), DT);
         assert(BBExit->getUniqueSuccessor() == EndBB &&
-               "Expected unique successor at region start BB");
+               "Expected unique successor at region end BB");
         BasicBlock *AfterBB =
             SplitBlock(EndBB, &*EndBB->getFirstInsertionPt(), DT);
 
@@ -156,60 +379,15 @@ namespace {
         // Define the default FiniCB lambda.
         auto FiniCB = [&](InsertPointTy CodeGenIP) {};
 
+        // Remove intrinsics of OpenMP tags, first CBExit to also remove use
+        // of CBEntry, then CBEntry.
+        CBExit->eraseFromParent();
+        CBEntry->eraseFromParent();
+
         if(Dir == OMPD_parallel) {
-          auto PrivCB = [&](InsertPointTy AllocaIP, InsertPointTy CodeGenIP,
-                            Value &Orig, Value &Inner,
-                            Value *&ReplacementValue) -> InsertPointTy {
-            auto It = DSAValueMap.find(&Inner);
-            dbgs() << "DSAValueMap for " << Inner;
-            if (It != DSAValueMap.end())
-              dbgs() << It->second;
-            else
-              dbgs() << "(null)!";
-            dbgs() << "\n ";
-
-            assert(It != DSAValueMap.end() && "Expected Value in DSAValueMap");
-
-            if (It->second == DSA_PRIVATE) {
-              OMPBuilder.Builder.restoreIP(AllocaIP);
-              Type *VTy = Inner.getType()->getPointerElementType();
-              ReplacementValue = OMPBuilder.Builder.CreateAlloca(
-                  VTy, /*ArraySize */ nullptr, Inner.getName());
-              dbgs() << "Privatizing Inner " << Inner << " -> to -> "
-                     << *ReplacementValue << "\n";
-            } else if (It->second == DSA_FIRSTPRIVATE) {
-              OMPBuilder.Builder.restoreIP(AllocaIP);
-              Type *VTy = Inner.getType()->getPointerElementType();
-              Value *V = OMPBuilder.Builder.CreateLoad(
-                  VTy, &Inner, Orig.getName() + ".reload");
-              ReplacementValue = OMPBuilder.Builder.CreateAlloca(
-                  VTy, /*ArraySize */ nullptr, Orig.getName() + ".copy");
-              OMPBuilder.Builder.restoreIP(CodeGenIP);
-              OMPBuilder.Builder.CreateStore(V, ReplacementValue);
-              dbgs() << "Firstprivatizing Inner " << Inner << " -> to -> "
-                     << *ReplacementValue << "\n";
-            } else {
-              ReplacementValue = &Inner;
-              dbgs() << "Shared Inner " << Inner << " -> to -> "
-                     << *ReplacementValue << "\n";
-            }
-
-            return CodeGenIP;
-          };
-
-          IRBuilder<>::InsertPoint AllocaIP(
-              &Fn->getEntryBlock(),
-              Fn->getEntryBlock().getFirstInsertionPt());
-
-          // Set the insertion location at the end of the BBEntry.
-          BBEntry->getTerminator()->eraseFromParent();
-          OpenMPIRBuilder::LocationDescription Loc(InsertPointTy(BBEntry, BBEntry->end()),
-                                                   DL);
-          InsertPointTy AfterIP = OMPBuilder.createParallel(
-              Loc, AllocaIP, BodyGenCB, PrivCB, FiniCB,
-              /* IfCondition*/ nullptr, /* NumThreads */ nullptr,
-              OMP_PROC_BIND_default, /* IsCancellable */ false);
-          BranchInst::Create(AfterBB, AfterIP.getBlock());
+          emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, AfterBB,
+                          BodyGenCB, FiniCB, ParRegionInfo.IfCondition,
+                          ParRegionInfo.NumThreads);
 
           dbgs() << "=== Before Fn\n" << *Fn << "=== End of Before Fn\n";
           OMPBuilder.finalize(Fn, /* AllowExtractorSinking */ true);
@@ -246,16 +424,53 @@ namespace {
           dbgs() << "=== Barrier Fn\n" << *Fn << "=== End of Barrier Fn\n";
         }
         else if (Dir == OMPD_for) {
-          assert(false && "OMPD_for is not supported yet!");
+          dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n";
+          dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n";
+          assert(OMPLoopInfo.IV && "Expected non-null IV");
+          assert(OMPLoopInfo.UB && "Expected non-null UB");
+
+          BasicBlock *PreHeader = StartBB;
+          BasicBlock *Header = PreHeader->getUniqueSuccessor();
+          BasicBlock *Exit = EndBB;
+          assert(Header &&
+                 "Expected unique successor from PreHeader to Header");
+          dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n";
+          dbgs() << "=== Header\n" << *Header << "=== End of Header\n";
+          dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n";
+
+          emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
+                     Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
+          dbgs() << "=== For Fn\n" << *Fn << "=== End of For Fn\n";
+          //assert(false && "OMPD_for is not supported yet!");
+        }
+        else if (Dir == OMPD_parallel_for) {
+          // TODO: Verify the DSA for IV, UB since they are implicit in the
+          // combined directive entry.
+          assert(OMPLoopInfo.IV && "Expected non-null IV");
+          assert(OMPLoopInfo.UB && "Expected non-null UB");
+
+          // TODO: Check setting DSA for IV, UB for correctness.
+          DSAValueMap[OMPLoopInfo.IV] = DSA_PRIVATE;
+          DSAValueMap[OMPLoopInfo.UB] = DSA_FIRSTPRIVATE;
+
+          BasicBlock *PreHeader = StartBB;
+          BasicBlock *Header = PreHeader->getUniqueSuccessor();
+          BasicBlock *Exit = EndBB;
+          assert(Header &&
+                 "Expected unique successor from PreHeader to Header");
+          dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n";
+          dbgs() << "=== Header\n" << *Header << "=== End of Header\n";
+          dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n";
+          emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
+                     Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
+          emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, AfterBB,
+                          BodyGenCB, FiniCB, ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
+          OMPBuilder.finalize(Fn, /* AllowExtractorSinking */ true);
         }
         else {
           dbgs() << "Unknown directive " << *CBEntry << "\n";
           assert(false && "Unknown directive");
         }
-        // Remove intrinsics of OpenMP tags, first CBExit to also remove use
-        // of CBEntry, then CBEntry.
-        CBExit->eraseFromParent();
-        CBEntry->eraseFromParent();
       }
 
       dbgs() << "=== Dump Lowered Module\n" << M << "=== End of Dump Lowered Module\n";
