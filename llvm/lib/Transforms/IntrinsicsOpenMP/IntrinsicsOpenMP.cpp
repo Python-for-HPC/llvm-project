@@ -49,6 +49,8 @@ namespace {
       {"DIR.OMP.BARRIER", OMPD_barrier},
       {"DIR.OMP.LOOP", OMPD_for},
       {"DIR.OMP.PARALLEL.LOOP", OMPD_parallel_for},
+      {"DIR.OMP.TASK", OMPD_task},
+      {"DIR.OMP.TASKWAIT", OMPD_taskwait}
   };
 
   static const DenseMap<StringRef, DSAType> StringToDSA = {
@@ -61,15 +63,12 @@ namespace {
   using BodyGenCallbackTy = OpenMPIRBuilder::BodyGenCallbackTy;
   using FinalizeCallbackTy = OpenMPIRBuilder::FinalizeCallbackTy;
 
-  LoopInfo *LI = nullptr;
-  DominatorTree *DT = nullptr;
-
   struct IntrinsicsOpenMP: public ModulePass {
     static char ID; // Pass identification, replacement for typeid
     IntrinsicsOpenMP() : ModulePass(ID) {}
 
     static void emitOMPParallel(OpenMPIRBuilder &OMPBuilder,
-                                DenseMap<Value *, DSAType> &DSAValueMap,
+                                MapVector<Value *, DSAType> &DSAValueMap,
                                 const DebugLoc &DL, Function *Fn,
                                 BasicBlock *BBEntry, BasicBlock *AfterBB,
                                 BodyGenCallbackTy BodyGenCB,
@@ -238,6 +237,277 @@ namespace {
                                /* CheckCancelFlag */ false);
     }
 
+    static void emitOMPTask(Module &M, OpenMPIRBuilder &OMPBuilder,
+                            MapVector<Value *, DSAType> &DSAValueMap,
+                            Function *Fn, BasicBlock *BBEntry,
+                            BasicBlock *StartBB, BasicBlock *EndBB,
+                            BasicBlock *AfterBB) {
+      // Define types.
+      // ************** START TYPE DEFINITION ************** //
+      enum {
+        TiedFlag = 0x1,
+        FinalFlag = 0x2,
+        DestructorsFlag = 0x8,
+        PriorityFlag = 0x20,
+        DetachableFlag = 0x40,
+      };
+
+      // This is a union for priority/firstprivate destructors, use the
+      // routine entry pointer to allocate space since it is larger than
+      // Int32Ty for priority, see kmp.h. Unused for now.
+      StructType *KmpCmplrdataTy =
+          StructType::create({OMPBuilder.TaskRoutineEntryPtr});
+      StructType *KmpTaskTTy = StructType::create(
+          {OMPBuilder.VoidPtr, OMPBuilder.TaskRoutineEntryPtr, OMPBuilder.Int32,
+           KmpCmplrdataTy, KmpCmplrdataTy},
+          "struct.kmp_task_t");
+      Type *KmpTaskTPtrTy = KmpTaskTTy->getPointerTo();
+
+      FunctionCallee KmpcOmpTaskAlloc = OMPBuilder.getOrCreateRuntimeFunction(
+          M, OMPRTL___kmpc_omp_task_alloc);
+      SmallVector<Type *, 8> SharedsTy;
+      SmallVector<Type *, 8> PrivatesTy;
+      for (auto &It : DSAValueMap) {
+        Value *OriginalValue = It.first;
+        if (It.second == DSA_SHARED)
+          SharedsTy.push_back(OriginalValue->getType());
+        else if (It.second == DSA_PRIVATE || It.second == DSA_FIRSTPRIVATE) {
+          assert(isa<PointerType>(OriginalValue->getType()) &&
+                 "Expected private, firstprivate value with pointer type");
+          // Store a copy of the value, thus get the pointer element type.
+          PrivatesTy.push_back(
+              OriginalValue->getType()->getPointerElementType());
+        } else
+          assert(false && "Unknown DSA type");
+      }
+
+      StructType *KmpSharedsTTy = nullptr;
+      if (SharedsTy.empty())
+          KmpSharedsTTy = StructType::create(M.getContext(), "struct.kmp_shareds");
+      else
+          KmpSharedsTTy = StructType::create(SharedsTy, "struct.kmp_shareds");
+      assert(KmpSharedsTTy && "Expected non-null KmpSharedsTTy");
+      Type *KmpSharedsTPtrTy = KmpSharedsTTy->getPointerTo();
+      StructType *KmpPrivatesTTy =
+          StructType::create(PrivatesTy, "struct.kmp_privates");
+      Type *KmpPrivatesTPtrTy = KmpPrivatesTTy->getPointerTo();
+      StructType *KmpTaskTWithPrivatesTy = StructType::create(
+          {KmpTaskTTy, KmpPrivatesTTy}, "struct.kmp_task_t_with_privates");
+      Type *KmpTaskTWithPrivatesPtrTy = KmpTaskTWithPrivatesTy->getPointerTo();
+
+      // Declare the task entry function.
+      Function *TaskEntryFn = Function::Create(
+          OMPBuilder.TaskRoutineEntry, GlobalValue::InternalLinkage,
+          Fn->getAddressSpace(), Fn->getName() + ".omp_task_entry", &M);
+      // Name arguments.
+      TaskEntryFn->getArg(0)->setName(".global_tid");
+      TaskEntryFn->getArg(1)->setName(".task_t_with_privates");
+
+      // Declare the task outlined function.
+      FunctionType *TaskOutlinedFnTy = FunctionType::get(
+          OMPBuilder.Void,
+          {OMPBuilder.Int32, OMPBuilder.Int32Ptr, OMPBuilder.VoidPtr,
+           KmpTaskTPtrTy, KmpSharedsTPtrTy},
+          /*isVarArg=*/false);
+      Function *TaskOutlinedFn = Function::Create(
+          TaskOutlinedFnTy, GlobalValue::InternalLinkage, Fn->getAddressSpace(),
+          Fn->getName() + ".omp_task_outlined", &M);
+      TaskOutlinedFn->getArg(0)->setName(".global_tid");
+      TaskOutlinedFn->getArg(1)->setName(".part_id");
+      TaskOutlinedFn->getArg(2)->setName(".privates");
+      TaskOutlinedFn->getArg(3)->setName(".task.data");
+      TaskOutlinedFn->getArg(4)->setName(".shareds");
+
+      // ************** END TYPE DEFINITION ************** //
+
+      // Emit kmpc_omp_task_alloc, kmpc_omp_task
+      {
+        const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
+        OpenMPIRBuilder::LocationDescription Loc(
+            InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()),
+            DL);
+        Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+        Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
+        // TODO: parse clauses, for now fix flags to tied
+        unsigned TaskFlags = TiedFlag;
+        Value *SizeofShareds = nullptr;
+        if (KmpSharedsTTy->isEmptyTy())
+          SizeofShareds = OMPBuilder.Builder.getInt64(0);
+        else
+          SizeofShareds = OMPBuilder.Builder.getInt64(
+              M.getDataLayout().getTypeAllocSize(KmpSharedsTTy));
+        Value *SizeofKmpTaskTWithPrivates = OMPBuilder.Builder.getInt64(
+            M.getDataLayout().getTypeAllocSize(KmpTaskTWithPrivatesTy));
+        OMPBuilder.Builder.SetInsertPoint(BBEntry,
+                                          BBEntry->getFirstInsertionPt());
+        Value *ThreadNum = OMPBuilder.getOrCreateThreadID(SrcLoc);
+        Value *KmpTaskTWithPrivatesVoidPtr = OMPBuilder.Builder.CreateCall(
+            KmpcOmpTaskAlloc,
+            {SrcLoc, ThreadNum, OMPBuilder.Builder.getInt32(TaskFlags),
+             SizeofKmpTaskTWithPrivates, SizeofShareds, TaskEntryFn},
+            ".task.data");
+        Value *KmpTaskTWithPrivates = OMPBuilder.Builder.CreateBitCast(
+            KmpTaskTWithPrivatesVoidPtr, KmpTaskTWithPrivatesPtrTy);
+
+        const unsigned KmpTaskTIdx = 0;
+        const unsigned KmpSharedsIdx = 0;
+        Value *KmpTaskT = OMPBuilder.Builder.CreateStructGEP(
+            KmpTaskTWithPrivatesTy, KmpTaskTWithPrivates, KmpTaskTIdx);
+        Value *KmpSharedsGEP = OMPBuilder.Builder.CreateStructGEP(
+            KmpTaskTTy, KmpTaskT, KmpSharedsIdx);
+        Value *KmpSharedsVoidPtr =
+            OMPBuilder.Builder.CreateLoad(OMPBuilder.VoidPtr, KmpSharedsGEP);
+        Value *KmpShareds = OMPBuilder.Builder.CreateBitCast(KmpSharedsVoidPtr,
+                                                             KmpSharedsTPtrTy);
+        const unsigned KmpPrivatesIdx = 1;
+        Value *KmpPrivates = OMPBuilder.Builder.CreateStructGEP(
+            KmpTaskTWithPrivatesTy, KmpTaskTWithPrivates, KmpPrivatesIdx);
+
+        // Store shareds by reference, firstprivates by value, in task data storage.
+        unsigned SharedsGEPIdx = 0;
+        unsigned PrivatesGEPIdx = 0;
+        for (auto &It : DSAValueMap) {
+          Value *OriginalValue = It.first;
+          if (It.second == DSA_SHARED) {
+            Value *SharedGEP = OMPBuilder.Builder.CreateStructGEP(
+                KmpSharedsTTy, KmpShareds, SharedsGEPIdx,
+                OriginalValue->getName() + ".task.shared");
+            OMPBuilder.Builder.CreateStore(OriginalValue, SharedGEP);
+            ++SharedsGEPIdx;
+          } else if (It.second == DSA_FIRSTPRIVATE) {
+            Value *FirstprivateGEP = OMPBuilder.Builder.CreateStructGEP(
+                KmpPrivatesTTy, KmpPrivates, PrivatesGEPIdx,
+                OriginalValue->getName() + ".task.firstprivate");
+            Value *Load = OMPBuilder.Builder.CreateLoad(
+                OriginalValue->getType()->getPointerElementType(),
+                OriginalValue);
+            OMPBuilder.Builder.CreateStore(Load, FirstprivateGEP);
+            ++PrivatesGEPIdx;
+          } else if (It.second == DSA_PRIVATE)
+            ++PrivatesGEPIdx;
+        }
+
+        FunctionCallee KmpcOmpTask =
+            OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_omp_task);
+        OMPBuilder.Builder.CreateCall(
+            KmpcOmpTask, {SrcLoc, ThreadNum, KmpTaskTWithPrivatesVoidPtr});
+      }
+
+      // Emit task entry function.
+      {
+        BasicBlock *TaskEntryBB =
+            BasicBlock::Create(M.getContext(), "entry", TaskEntryFn);
+        OMPBuilder.Builder.SetInsertPoint(TaskEntryBB);
+        const unsigned TaskTIdx= 0;
+        const unsigned PrivatesIdx = 1;
+        const unsigned SharedsIdx = 0;
+        Value *GTId = TaskEntryFn->getArg(0);
+        Value *KmpTaskTWithPrivates = OMPBuilder.Builder.CreateBitCast(
+            TaskEntryFn->getArg(1), KmpTaskTWithPrivatesPtrTy);
+        Value *KmpTaskT = OMPBuilder.Builder.CreateStructGEP(
+            KmpTaskTWithPrivatesTy, KmpTaskTWithPrivates, TaskTIdx,
+            ".task.data");
+        Value *SharedsGEP = OMPBuilder.Builder.CreateStructGEP(
+            KmpTaskTTy, KmpTaskT, SharedsIdx, ".shareds.gep");
+        Value *SharedsVoidPtr = OMPBuilder.Builder.CreateLoad(
+            OMPBuilder.VoidPtr, SharedsGEP, ".shareds.void.ptr");
+        Value *Shareds = OMPBuilder.Builder.CreateBitCast(
+            SharedsVoidPtr, KmpSharedsTPtrTy, ".shareds");
+
+        Value *Privates = nullptr;
+        if (PrivatesTy.empty()) {
+          Privates = Constant::getNullValue(OMPBuilder.VoidPtr);
+        } else {
+          Value *PrivatesTyped = OMPBuilder.Builder.CreateStructGEP(
+              KmpTaskTWithPrivatesTy, KmpTaskTWithPrivates, PrivatesIdx,
+              ".privates");
+          Privates = OMPBuilder.Builder.CreateBitCast(
+              PrivatesTyped, OMPBuilder.VoidPtr, ".privates.void.ptr");
+        }
+        assert(Privates && "Expected non-null privates");
+
+        const unsigned PartIdIdx = 2;
+        Value *PartId = OMPBuilder.Builder.CreateStructGEP(
+            KmpTaskTTy, KmpTaskT, PartIdIdx, ".part_id");
+        OMPBuilder.Builder.CreateCall(
+            TaskOutlinedFnTy, TaskOutlinedFn,
+            {GTId, PartId, Privates, KmpTaskT, Shareds});
+        OMPBuilder.Builder.CreateRet(OMPBuilder.Builder.getInt32(0));
+      }
+
+      // Emit TaskOutlinedFn code.
+      {
+        OpenMPIRBuilder::OutlineInfo OI;
+        OI.EntryBB = StartBB;
+        OI.ExitBB = EndBB;
+        SmallPtrSet<BasicBlock *, 8> OutlinedBlockSet;
+        SmallVector<BasicBlock *, 8> OutlinedBlockVector;
+        OI.collectBlocks(OutlinedBlockSet, OutlinedBlockVector);
+        BasicBlock *TaskOutlinedEntryBB =
+            BasicBlock::Create(M.getContext(), "entry", TaskOutlinedFn);
+        BasicBlock *TaskOutlinedExitBB =
+            BasicBlock::Create(M.getContext(), "exit", TaskOutlinedFn);
+        for (BasicBlock *BB : OutlinedBlockVector)
+          BB->moveBefore(TaskOutlinedExitBB);
+        // Explicitly move EndBB to the outlined functions, since OutlineInfo
+        // does not contain it in the OutlinedBlockVector.
+        EndBB->moveBefore(TaskOutlinedExitBB);
+        EndBB->getTerminator()->setSuccessor(0, TaskOutlinedExitBB);
+
+        OMPBuilder.Builder.SetInsertPoint(TaskOutlinedEntryBB);
+        const unsigned KmpPrivatesArgNo = 2;
+        const unsigned KmpSharedsArgNo = 4;
+        Value *KmpPrivatesArgVoidPtr = TaskOutlinedFn->getArg(KmpPrivatesArgNo);
+        Value *KmpPrivatesArg = OMPBuilder.Builder.CreateBitCast(
+            KmpPrivatesArgVoidPtr, KmpPrivatesTPtrTy);
+        Value *KmpSharedsArg = TaskOutlinedFn->getArg(KmpSharedsArgNo);
+
+        // Replace shareds, privates, firstprivates to refer to task data
+        // storage.
+        unsigned SharedsGEPIdx = 0;
+        unsigned PrivatesGEPIdx = 0;
+        for (auto &It : DSAValueMap) {
+          Value *OriginalValue = It.first;
+          Value *ReplacementValue = nullptr;
+          if (It.second == DSA_SHARED) {
+            Value *SharedGEP = OMPBuilder.Builder.CreateStructGEP(
+                KmpSharedsTTy, KmpSharedsArg, SharedsGEPIdx,
+                OriginalValue->getName() + ".task.shared.gep");
+            ReplacementValue = OMPBuilder.Builder.CreateLoad(
+                OriginalValue->getType(), SharedGEP,
+                OriginalValue->getName() + ".task.shared");
+            ++SharedsGEPIdx;
+          } else if (It.second == DSA_PRIVATE) {
+            Value *PrivateGEP = OMPBuilder.Builder.CreateStructGEP(
+                KmpPrivatesTTy, KmpPrivatesArg, PrivatesGEPIdx,
+                OriginalValue->getName() + ".task.private.gep");
+            ReplacementValue = PrivateGEP;
+            ++PrivatesGEPIdx;
+          } else if (It.second == DSA_FIRSTPRIVATE) {
+            Value *FirstprivateGEP = OMPBuilder.Builder.CreateStructGEP(
+                KmpPrivatesTTy, KmpPrivatesArg, PrivatesGEPIdx,
+                OriginalValue->getName() + ".task.firstprivate.gep");
+            ReplacementValue = FirstprivateGEP;
+            ++PrivatesGEPIdx;
+          }
+          else
+            assert(false && "Unknown DSA type");
+
+          assert(ReplacementValue && "Expected non-null ReplacementValue");
+          SmallVector<User *, 8> Users(OriginalValue->users());
+          for (User *U : Users)
+            if (Instruction *I = dyn_cast<Instruction>(U))
+              if (OutlinedBlockSet.contains(I->getParent()))
+                I->replaceUsesOfWith(OriginalValue, ReplacementValue);
+        }
+
+        OMPBuilder.Builder.CreateBr(StartBB);
+        OMPBuilder.Builder.SetInsertPoint(TaskOutlinedExitBB);
+        OMPBuilder.Builder.CreateRetVoid();
+        BBEntry->getTerminator()->setSuccessor(0, AfterBB);
+      }
+    }
+
     bool runOnModule(Module &M) override {
       dbgs() << "=== Start IntrinsicsOpenMPPass v4\n";
 
@@ -257,7 +527,7 @@ namespace {
       // Iterate over all calls to directive intrinsics and transform code
       // using OpenMPIRBuilder for lowering.
       SmallVector<User *, 4> RegionEntryUsers(RegionEntryF->users());
-      for(User *Usr : RegionEntryUsers) {
+      for (User *Usr : RegionEntryUsers) {
         dbgs() << "Found Usr " << *Usr << "\n";
         CallBase *CBEntry = dyn_cast<CallBase>(Usr);
         assert(CBEntry && "Expected call to region entry intrinsic");
@@ -266,7 +536,7 @@ namespace {
         // from the operand bundles of the intrinsic call.
         Directive Dir = OMPD_unknown;
         SmallVector<OperandBundleDef, 16> OpBundles;
-        DenseMap<Value *, DSAType>  DSAValueMap;
+        MapVector<Value *, DSAType> DSAValueMap;
 
         struct {
           Value *IV = nullptr;
@@ -283,7 +553,7 @@ namespace {
 
         CBEntry->getOperandBundlesAsDefs(OpBundles);
         // TODO: parse clauses.
-        for(OperandBundleDef &O : OpBundles) {
+        for (OperandBundleDef &O : OpBundles) {
           StringRef Tag = O.getTag();
           dbgs() << "OPB " << Tag << "\n";
 
@@ -299,19 +569,18 @@ namespace {
               if (Tag.startswith("QUAL.OMP.NORMALIZED.IV")) {
                 assert(O.input_size() == 1 && "Expected single IV value");
                 OMPLoopInfo.IV = V;
-              }
-              else if (Tag.startswith("QUAL.OMP.NORMALIZED.UB")) {
+              } else if (Tag.startswith("QUAL.OMP.NORMALIZED.UB")) {
                 assert(O.input_size() == 1 && "Expected single UB value");
                 OMPLoopInfo.UB = V;
-              }
-              else if (Tag.startswith("QUAL.OMP.NUM_THREADS")) {
-                assert(O.input_size() == 1 && "Expected single NumThreads value");
+              } else if (Tag.startswith("QUAL.OMP.NUM_THREADS")) {
+                assert(O.input_size() == 1 &&
+                       "Expected single NumThreads value");
                 ParRegionInfo.NumThreads = V;
                 // TODO: Check DSA value for NumThreads value.
                 DSAValueMap[V] = DSA_FIRSTPRIVATE;
-              }
-              else if (Tag.startswith("QUAL.OMP.SCHEDULE")) {
-                assert(O.input_size() == 1 && "Expected single chunking scheduling value");
+              } else if (Tag.startswith("QUAL.OMP.SCHEDULE")) {
+                assert(O.input_size() == 1 &&
+                       "Expected single chunking scheduling value");
                 Constant *Zero = ConstantInt::get(V->getType(), 0);
                 OMPLoopInfo.Chunk = V;
 
@@ -324,12 +593,11 @@ namespace {
                     OMPLoopInfo.Sched = OMPScheduleType::StaticChunked;
                 } else
                   assert(false && "Unsupported scheduling type");
-              }
-              else if (Tag.startswith("QUAL.OMP.IF")) {
-                assert(O.input_size() == 1 && "Expected single if condition value");
+              } else if (Tag.startswith("QUAL.OMP.IF")) {
+                assert(O.input_size() == 1 &&
+                       "Expected single if condition value");
                 ParRegionInfo.IfCondition = V;
-              }
-              else /* DSA Qualifiers */ {
+              } else /* DSA Qualifiers */ {
                 auto It = StringToDSA.find(Tag);
                 assert(It != StringToDSA.end() && "DSA type not found in map");
                 DSAValueMap[V] = It->second;
@@ -345,7 +613,8 @@ namespace {
         Use &U = *CBEntry->use_begin();
         CallBase *CBExit = dyn_cast<CallBase>(U.getUser());
         assert(CBExit && "Expected call to region exit intrinsic");
-        dbgs() << "Found Use of " << *CBEntry << "\n-> AT ->\n" << *CBExit << "\n";
+        dbgs() << "Found Use of " << *CBEntry << "\n-> AT ->\n"
+               << *CBExit << "\n";
 
         // Gather info.
         BasicBlock *BBEntry = CBEntry->getParent();
@@ -353,23 +622,21 @@ namespace {
         const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
 
         // Create the basic block structure to isolate the outlined region.
-        BasicBlock *StartBB = SplitBlock(BBEntry, CBEntry, DT);
+        BasicBlock *StartBB = SplitBlock(BBEntry, CBEntry);
         assert(BBEntry->getUniqueSuccessor() == StartBB &&
                "Expected unique successor at region start BB");
 
         BasicBlock *BBExit = CBExit->getParent();
-        BasicBlock *EndBB = SplitBlock(BBExit, CBExit->getNextNode(), DT);
+        BasicBlock *EndBB = SplitBlock(BBExit, CBExit->getNextNode());
         assert(BBExit->getUniqueSuccessor() == EndBB &&
                "Expected unique successor at region end BB");
-        BasicBlock *AfterBB =
-            SplitBlock(EndBB, &*EndBB->getFirstInsertionPt(), DT);
+        BasicBlock *AfterBB = SplitBlock(EndBB, &*EndBB->getFirstInsertionPt());
 
         // Define the default BodyGenCB lambda.
         auto BodyGenCB = [&](InsertPointTy AllocaIP, InsertPointTy CodeGenIP,
                              BasicBlock &ContinuationIP) {
           BasicBlock *CGStartBB = CodeGenIP.getBlock();
-          BasicBlock *CGEndBB =
-              SplitBlock(CGStartBB, &*CodeGenIP.getPoint(), DT, LI);
+          BasicBlock *CGEndBB = SplitBlock(CGStartBB, &*CodeGenIP.getPoint());
           assert(StartBB != nullptr && "StartBB should not be null");
           CGStartBB->getTerminator()->setSuccessor(0, StartBB);
           assert(EndBB != nullptr && "EndBB should not be null");
@@ -384,7 +651,7 @@ namespace {
         CBExit->eraseFromParent();
         CBEntry->eraseFromParent();
 
-        if(Dir == OMPD_parallel) {
+        if (Dir == OMPD_parallel) {
           emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, AfterBB,
                           BodyGenCB, FiniCB, ParRegionInfo.IfCondition,
                           ParRegionInfo.NumThreads);
@@ -395,8 +662,8 @@ namespace {
         } else if (Dir == OMPD_single) {
           // Set the insertion location at the end of the BBEntry.
           BBEntry->getTerminator()->eraseFromParent();
-          OpenMPIRBuilder::LocationDescription Loc(InsertPointTy(BBEntry, BBEntry->end()),
-                                                   DL);
+          OpenMPIRBuilder::LocationDescription Loc(
+              InsertPointTy(BBEntry, BBEntry->end()), DL);
 
           InsertPointTy AfterIP = OMPBuilder.createSingle(
               Loc, BodyGenCB, FiniCB, /*DidIt*/ nullptr);
@@ -405,25 +672,26 @@ namespace {
         } else if (Dir == OMPD_critical) {
           // Set the insertion location at the end of the BBEntry.
           BBEntry->getTerminator()->eraseFromParent();
-          OpenMPIRBuilder::LocationDescription Loc(InsertPointTy(BBEntry, BBEntry->end()),
-                                                   DL);
+          OpenMPIRBuilder::LocationDescription Loc(
+              InsertPointTy(BBEntry, BBEntry->end()), DL);
 
-          InsertPointTy AfterIP = OMPBuilder.createCritical(Loc, BodyGenCB, FiniCB, "",
-                                    /*HintInst*/ nullptr);
+          InsertPointTy AfterIP =
+              OMPBuilder.createCritical(Loc, BodyGenCB, FiniCB, "",
+                                        /*HintInst*/ nullptr);
           BranchInst::Create(AfterBB, AfterIP.getBlock());
           dbgs() << "=== Critical Fn\n" << *Fn << "=== End of Critical Fn\n";
-        }
-        else if (Dir == OMPD_barrier) {
+        } else if (Dir == OMPD_barrier) {
           // Set the insertion location at the end of the BBEntry.
-          OpenMPIRBuilder::LocationDescription Loc(InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()),
-                                                   DL);
+          OpenMPIRBuilder::LocationDescription Loc(
+              InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()),
+              DL);
 
           // TODO: check ForceSimpleCall usage.
-          OMPBuilder.createBarrier(Loc, OMPD_barrier, /*ForceSimpleCall*/ false,
+          OMPBuilder.createBarrier(Loc, OMPD_barrier,
+                                   /*ForceSimpleCall*/ false,
                                    /*CheckCancelFlag*/ true);
           dbgs() << "=== Barrier Fn\n" << *Fn << "=== End of Barrier Fn\n";
-        }
-        else if (Dir == OMPD_for) {
+        } else if (Dir == OMPD_for) {
           dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n";
           dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n";
           assert(OMPLoopInfo.IV && "Expected non-null IV");
@@ -441,9 +709,7 @@ namespace {
           emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
                      Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
           dbgs() << "=== For Fn\n" << *Fn << "=== End of For Fn\n";
-          //assert(false && "OMPD_for is not supported yet!");
-        }
-        else if (Dir == OMPD_parallel_for) {
+        } else if (Dir == OMPD_parallel_for) {
           // TODO: Verify the DSA for IV, UB since they are implicit in the
           // combined directive entry.
           assert(OMPLoopInfo.IV && "Expected non-null IV");
@@ -464,18 +730,29 @@ namespace {
           emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
                      Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
           emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, AfterBB,
-                          BodyGenCB, FiniCB, ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
+                          BodyGenCB, FiniCB, ParRegionInfo.IfCondition,
+                          ParRegionInfo.NumThreads);
           OMPBuilder.finalize(Fn, /* AllowExtractorSinking */ true);
-        }
-        else {
+        } else if (Dir == OMPD_task) {
+          emitOMPTask(M, OMPBuilder, DSAValueMap, Fn, BBEntry, StartBB, EndBB,
+                      AfterBB);
+        } else if (Dir == OMPD_taskwait) {
+          // Set the insertion location at the end of the BBEntry.
+          OpenMPIRBuilder::LocationDescription Loc(
+              InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()),
+              DL);
+
+          OMPBuilder.createTaskwait(Loc);
+        } else {
           dbgs() << "Unknown directive " << *CBEntry << "\n";
           assert(false && "Unknown directive");
         }
       }
 
-      dbgs() << "=== Dump Lowered Module\n" << M << "=== End of Dump Lowered Module\n";
+      dbgs() << "=== Dump Lowered Module\n"
+             << M << "=== End of Dump Lowered Module\n";
 
-      dbgs() << "=== End of IntrinscsOpenMP pass\n";
+      dbgs() << "=== End of IntrinsicsOpenMP pass\n";
       return true;
     }
 
