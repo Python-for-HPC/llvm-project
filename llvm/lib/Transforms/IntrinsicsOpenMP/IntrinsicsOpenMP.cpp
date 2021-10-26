@@ -79,12 +79,12 @@ namespace {
                         Value &Orig, Value &Inner,
                         Value *&ReplacementValue) -> InsertPointTy {
         auto It = DSAValueMap.find(&Orig);
-        dbgs() << "DSAValueMap for Orig " << Orig << " Inner " << Inner;
+        LLVM_DEBUG(dbgs() << "DSAValueMap for Orig " << Orig << " Inner " << Inner);
         if (It != DSAValueMap.end())
-          dbgs() << It->second;
+          LLVM_DEBUG(dbgs() << It->second);
         else
-          dbgs() << " (null)!";
-        dbgs() << "\n ";
+          LLVM_DEBUG(dbgs() << " (null)!");
+        LLVM_DEBUG(dbgs() << "\n ");
 
         assert(It != DSAValueMap.end() && "Expected Value in DSAValueMap");
 
@@ -93,8 +93,8 @@ namespace {
           Type *VTy = Inner.getType()->getPointerElementType();
           ReplacementValue = OMPBuilder.Builder.CreateAlloca(
               VTy, /*ArraySize */ nullptr, Inner.getName());
-          dbgs() << "Privatizing Inner " << Inner << " -> to -> "
-                 << *ReplacementValue << "\n";
+          LLVM_DEBUG(dbgs() << "Privatizing Inner " << Inner << " -> to -> "
+                 << *ReplacementValue << "\n");
         } else if (It->second == DSA_FIRSTPRIVATE) {
           OMPBuilder.Builder.restoreIP(AllocaIP);
           Type *VTy = Inner.getType()->getPointerElementType();
@@ -104,12 +104,12 @@ namespace {
               VTy, /*ArraySize */ nullptr, Orig.getName() + ".copy");
           OMPBuilder.Builder.restoreIP(CodeGenIP);
           OMPBuilder.Builder.CreateStore(V, ReplacementValue);
-          dbgs() << "Firstprivatizing Inner " << Inner << " -> to -> "
-                 << *ReplacementValue << "\n";
+          LLVM_DEBUG(dbgs() << "Firstprivatizing Inner " << Inner << " -> to -> "
+                 << *ReplacementValue << "\n");
         } else {
           ReplacementValue = &Inner;
-          dbgs() << "Shared Inner " << Inner << " -> to -> "
-                 << *ReplacementValue << "\n";
+          LLVM_DEBUG(dbgs() << "Shared Inner " << Inner << " -> to -> "
+                 << *ReplacementValue << "\n");
         }
 
         return CodeGenIP;
@@ -145,9 +145,9 @@ namespace {
       Type *IVTy = IV->getType()->getPointerElementType();
 
       auto GetKmpcForStaticInit = [&]() -> FunctionCallee {
-        dbgs() << "Type " << *IVTy << "\n";
+        LLVM_DEBUG(dbgs() << "Type " << *IVTy << "\n");
         unsigned Bitwidth = IVTy->getIntegerBitWidth();
-        dbgs() << "Bitwidth " << Bitwidth << "\n";
+        LLVM_DEBUG(dbgs() << "Bitwidth " << Bitwidth << "\n");
         if (Bitwidth == 32)
           return OMPBuilder.getOrCreateRuntimeFunction(
               M, OMPRTL___kmpc_for_static_init_4u);
@@ -205,12 +205,12 @@ namespace {
       Constant *SchedulingType =
           ConstantInt::get(I32Type, static_cast<int>(Sched));
 
-      dbgs() << "=== SchedulingType " << *SchedulingType << "\n";
-      dbgs() << "=== PLowerBound " << *PLowerBound << "\n";
-      dbgs() << "=== PUpperBound " << *PUpperBound << "\n";
-      dbgs() << "=== PStride " << *PStride << "\n";
-      dbgs() << "=== Incr " << *One << "\n";
-      dbgs() << "=== ChunkCast " << *ChunkCast << "\n";
+      LLVM_DEBUG(dbgs() << "=== SchedulingType " << *SchedulingType << "\n");
+      LLVM_DEBUG(dbgs() << "=== PLowerBound " << *PLowerBound << "\n");
+      LLVM_DEBUG(dbgs() << "=== PUpperBound " << *PUpperBound << "\n");
+      LLVM_DEBUG(dbgs() << "=== PStride " << *PStride << "\n");
+      LLVM_DEBUG(dbgs() << "=== Incr " << *One << "\n");
+      LLVM_DEBUG(dbgs() << "=== ChunkCast " << *ChunkCast << "\n");
       OMPBuilder.Builder.CreateCall(
           KmpcForStaticInit, {SrcLoc, ThreadNum, SchedulingType, PLastIter,
                               PLowerBound, PUpperBound, PStride, One, ChunkCast});
@@ -509,26 +509,26 @@ namespace {
     }
 
     bool runOnModule(Module &M) override {
-      dbgs() << "=== Start IntrinsicsOpenMPPass v4\n";
+      LLVM_DEBUG(dbgs() << "=== Start IntrinsicsOpenMPPass v4\n");
 
       Function *RegionEntryF = M.getFunction("llvm.directive.region.entry");
 
       // Return early for lack of directive intrinsics.
       if (!RegionEntryF) {
-        dbgs() << "No intrinsics directives, exiting...\n";
+        LLVM_DEBUG(dbgs() << "No intrinsics directives, exiting...\n");
         return false;
       }
 
       OpenMPIRBuilder OMPBuilder(M);
       OMPBuilder.initialize();
 
-      dbgs() << "=== Dump module\n" << M << "=== End of Dump module\n";
+      LLVM_DEBUG(dbgs() << "=== Dump module\n" << M << "=== End of Dump module\n");
 
       // Iterate over all calls to directive intrinsics and transform code
       // using OpenMPIRBuilder for lowering.
       SmallVector<User *, 4> RegionEntryUsers(RegionEntryF->users());
       for (User *Usr : RegionEntryUsers) {
-        dbgs() << "Found Usr " << *Usr << "\n";
+        LLVM_DEBUG(dbgs() << "Found Usr " << *Usr << "\n");
         CallBase *CBEntry = dyn_cast<CallBase>(Usr);
         assert(CBEntry && "Expected call to region entry intrinsic");
 
@@ -555,7 +555,7 @@ namespace {
         // TODO: parse clauses.
         for (OperandBundleDef &O : OpBundles) {
           StringRef Tag = O.getTag();
-          dbgs() << "OPB " << Tag << "\n";
+          LLVM_DEBUG(dbgs() << "OPB " << Tag << "\n");
 
           if (Tag.startswith("DIR")) {
             auto It = StringToDir.find(Tag);
@@ -613,8 +613,8 @@ namespace {
         Use &U = *CBEntry->use_begin();
         CallBase *CBExit = dyn_cast<CallBase>(U.getUser());
         assert(CBExit && "Expected call to region exit intrinsic");
-        dbgs() << "Found Use of " << *CBEntry << "\n-> AT ->\n"
-               << *CBExit << "\n";
+        LLVM_DEBUG(dbgs() << "Found Use of " << *CBEntry << "\n-> AT ->\n"
+               << *CBExit << "\n");
 
         // Gather info.
         BasicBlock *BBEntry = CBEntry->getParent();
@@ -656,9 +656,9 @@ namespace {
                           BodyGenCB, FiniCB, ParRegionInfo.IfCondition,
                           ParRegionInfo.NumThreads);
 
-          dbgs() << "=== Before Fn\n" << *Fn << "=== End of Before Fn\n";
+          LLVM_DEBUG(dbgs() << "=== Before Fn\n" << *Fn << "=== End of Before Fn\n");
           OMPBuilder.finalize(Fn, /* AllowExtractorSinking */ true);
-          dbgs() << "=== Finalize Fn\n" << *Fn << "=== End of Finalize Fn\n";
+          LLVM_DEBUG(dbgs() << "=== Finalize Fn\n" << *Fn << "=== End of Finalize Fn\n");
         } else if (Dir == OMPD_single) {
           // Set the insertion location at the end of the BBEntry.
           BBEntry->getTerminator()->eraseFromParent();
@@ -668,7 +668,7 @@ namespace {
           InsertPointTy AfterIP = OMPBuilder.createSingle(
               Loc, BodyGenCB, FiniCB, /*DidIt*/ nullptr);
           BranchInst::Create(AfterBB, AfterIP.getBlock());
-          dbgs() << "=== Single Fn\n" << *Fn << "=== End of Single Fn\n";
+          LLVM_DEBUG(dbgs() << "=== Single Fn\n" << *Fn << "=== End of Single Fn\n");
         } else if (Dir == OMPD_critical) {
           // Set the insertion location at the end of the BBEntry.
           BBEntry->getTerminator()->eraseFromParent();
@@ -679,7 +679,7 @@ namespace {
               OMPBuilder.createCritical(Loc, BodyGenCB, FiniCB, "",
                                         /*HintInst*/ nullptr);
           BranchInst::Create(AfterBB, AfterIP.getBlock());
-          dbgs() << "=== Critical Fn\n" << *Fn << "=== End of Critical Fn\n";
+          LLVM_DEBUG(dbgs() << "=== Critical Fn\n" << *Fn << "=== End of Critical Fn\n");
         } else if (Dir == OMPD_barrier) {
           // Set the insertion location at the end of the BBEntry.
           OpenMPIRBuilder::LocationDescription Loc(
@@ -690,10 +690,10 @@ namespace {
           OMPBuilder.createBarrier(Loc, OMPD_barrier,
                                    /*ForceSimpleCall*/ false,
                                    /*CheckCancelFlag*/ true);
-          dbgs() << "=== Barrier Fn\n" << *Fn << "=== End of Barrier Fn\n";
+          LLVM_DEBUG(dbgs() << "=== Barrier Fn\n" << *Fn << "=== End of Barrier Fn\n");
         } else if (Dir == OMPD_for) {
-          dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n";
-          dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n";
+          LLVM_DEBUG(dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n");
+          LLVM_DEBUG(dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n");
           assert(OMPLoopInfo.IV && "Expected non-null IV");
           assert(OMPLoopInfo.UB && "Expected non-null UB");
 
@@ -702,13 +702,13 @@ namespace {
           BasicBlock *Exit = EndBB;
           assert(Header &&
                  "Expected unique successor from PreHeader to Header");
-          dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n";
-          dbgs() << "=== Header\n" << *Header << "=== End of Header\n";
-          dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n";
+          LLVM_DEBUG(dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n");
+          LLVM_DEBUG(dbgs() << "=== Header\n" << *Header << "=== End of Header\n");
+          LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
 
           emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
                      Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
-          dbgs() << "=== For Fn\n" << *Fn << "=== End of For Fn\n";
+          LLVM_DEBUG(dbgs() << "=== For Fn\n" << *Fn << "=== End of For Fn\n");
         } else if (Dir == OMPD_parallel_for) {
           // TODO: Verify the DSA for IV, UB since they are implicit in the
           // combined directive entry.
@@ -724,9 +724,9 @@ namespace {
           BasicBlock *Exit = EndBB;
           assert(Header &&
                  "Expected unique successor from PreHeader to Header");
-          dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n";
-          dbgs() << "=== Header\n" << *Header << "=== End of Header\n";
-          dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n";
+          LLVM_DEBUG(dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n");
+          LLVM_DEBUG(dbgs() << "=== Header\n" << *Header << "=== End of Header\n");
+          LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
           emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
                      Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
           emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, AfterBB,
@@ -744,15 +744,15 @@ namespace {
 
           OMPBuilder.createTaskwait(Loc);
         } else {
-          dbgs() << "Unknown directive " << *CBEntry << "\n";
+          LLVM_DEBUG(dbgs() << "Unknown directive " << *CBEntry << "\n");
           assert(false && "Unknown directive");
         }
       }
 
-      dbgs() << "=== Dump Lowered Module\n"
-             << M << "=== End of Dump Lowered Module\n";
+      LLVM_DEBUG(dbgs() << "=== Dump Lowered Module\n"
+             << M << "=== End of Dump Lowered Module\n");
 
-      dbgs() << "=== End of IntrinsicsOpenMP pass\n";
+      LLVM_DEBUG(dbgs() << "=== End of IntrinsicsOpenMP pass\n");
       return true;
     }
 
