@@ -39,7 +39,8 @@ namespace {
   enum DSAType {
     DSA_PRIVATE,
     DSA_FIRSTPRIVATE,
-    DSA_SHARED
+    DSA_SHARED,
+    DSA_REDUCTION_ADD
   };
 
   static const DenseMap<StringRef, Directive> StringToDir = {
@@ -53,10 +54,45 @@ namespace {
       {"DIR.OMP.TASKWAIT", OMPD_taskwait}
   };
 
+  // TODO: add more reduction operators.
   static const DenseMap<StringRef, DSAType> StringToDSA = {
       {"QUAL.OMP.PRIVATE", DSA_PRIVATE},
       {"QUAL.OMP.FIRSTPRIVATE", DSA_FIRSTPRIVATE},
       {"QUAL.OMP.SHARED", DSA_SHARED},
+      {"QUAL.OMP.REDUCTION.ADD", DSA_REDUCTION_ADD},
+  };
+
+  struct CGReduction {
+    static OpenMPIRBuilder::InsertPointTy
+    sumReduction(OpenMPIRBuilder::InsertPointTy IP, Value *LHS, Value *RHS,
+                 Value *&Result) {
+      IRBuilder<> Builder(IP.getBlock(), IP.getPoint());
+      Type *VTy = RHS->getType();
+      if (VTy->isIntegerTy())
+        Result = Builder.CreateAdd(LHS, RHS, "red.add");
+      else if (VTy->isFloatTy() || VTy->isDoubleTy())
+        Result = Builder.CreateFAdd(LHS, RHS, "red.add");
+      else
+        assert(false && "Unsupported type for sumReduction");
+      return Builder.saveIP();
+    }
+
+    static OpenMPIRBuilder::InsertPointTy
+    sumAtomicReduction(OpenMPIRBuilder::InsertPointTy IP, Value *LHS,
+                       Value *RHS) {
+      IRBuilder<> Builder(IP.getBlock(), IP.getPoint());
+      Type *VTy = RHS->getType()->getPointerElementType();
+      Value *Partial = Builder.CreateLoad(VTy, RHS, "red.partial");
+      if (VTy->isIntegerTy())
+        Builder.CreateAtomicRMW(AtomicRMWInst::Add, LHS, Partial, None,
+                                AtomicOrdering::Monotonic);
+      else if (VTy->isFloatTy() || VTy->isDoubleTy())
+        Builder.CreateAtomicRMW(AtomicRMWInst::FAdd, LHS, Partial, None,
+                                AtomicOrdering::Monotonic);
+      else
+        assert(false && "Unsupported type for sumAtomicReduction");
+      return Builder.saveIP();
+    }
   };
 
   using InsertPointTy = OpenMPIRBuilder::InsertPointTy;
@@ -70,11 +106,13 @@ namespace {
     static void emitOMPParallel(OpenMPIRBuilder &OMPBuilder,
                                 MapVector<Value *, DSAType> &DSAValueMap,
                                 const DebugLoc &DL, Function *Fn,
-                                BasicBlock *BBEntry, BasicBlock *AfterBB,
-                                BodyGenCallbackTy BodyGenCB,
-                                FinalizeCallbackTy FiniCB,
-                                Value *IfCondition,
+                                BasicBlock *BBEntry, BasicBlock *StartBB,
+                                BasicBlock *EndBB, BasicBlock *AfterBB,
+                                FinalizeCallbackTy FiniCB, Value *IfCondition,
                                 Value *NumThreads) {
+      InsertPointTy BodyIP, BodyAllocaIP;
+      SmallVector<OpenMPIRBuilder::ReductionInfo> ReductionInfos;
+
       auto PrivCB = [&](InsertPointTy AllocaIP, InsertPointTy CodeGenIP,
                         Value &Orig, Value &Inner,
                         Value *&ReplacementValue) -> InsertPointTy {
@@ -88,14 +126,16 @@ namespace {
 
         assert(It != DSAValueMap.end() && "Expected Value in DSAValueMap");
 
-        if (It->second == DSA_PRIVATE) {
+        DSAType DSA = It->second;
+
+        if (DSA == DSA_PRIVATE) {
           OMPBuilder.Builder.restoreIP(AllocaIP);
           Type *VTy = Inner.getType()->getPointerElementType();
           ReplacementValue = OMPBuilder.Builder.CreateAlloca(
               VTy, /*ArraySize */ nullptr, Inner.getName());
           LLVM_DEBUG(dbgs() << "Privatizing Inner " << Inner << " -> to -> "
                  << *ReplacementValue << "\n");
-        } else if (It->second == DSA_FIRSTPRIVATE) {
+        } else if (DSA == DSA_FIRSTPRIVATE) {
           OMPBuilder.Builder.restoreIP(AllocaIP);
           Type *VTy = Inner.getType()->getPointerElementType();
           Value *V = OMPBuilder.Builder.CreateLoad(VTy, &Inner,
@@ -106,6 +146,27 @@ namespace {
           OMPBuilder.Builder.CreateStore(V, ReplacementValue);
           LLVM_DEBUG(dbgs() << "Firstprivatizing Inner " << Inner << " -> to -> "
                  << *ReplacementValue << "\n");
+        } else if (DSA == DSA_REDUCTION_ADD) {
+          OMPBuilder.Builder.restoreIP(AllocaIP);
+          Type *VTy = Inner.getType()->getPointerElementType();
+          Value *V = OMPBuilder.Builder.CreateAlloca(
+              VTy, /* ArraySize */ nullptr, Orig.getName() + ".red.priv");
+          ReplacementValue = V;
+
+          OMPBuilder.Builder.restoreIP(CodeGenIP);
+          // Store idempotent value based on operation and type.
+          // TODO: create templated emitInitAndAppendInfo in CGReduction
+          if (VTy->isIntegerTy())
+            OMPBuilder.Builder.CreateStore(ConstantInt::get(VTy, 0), V);
+          else if (VTy->isFloatTy() || VTy->isDoubleTy())
+            OMPBuilder.Builder.CreateStore(ConstantFP::get(VTy, 0.0), V);
+          else
+            assert(false && "Unsupported type to init with idempotent reduction value");
+
+          ReductionInfos.push_back({&Orig, V, CGReduction::sumReduction,
+                                    CGReduction::sumAtomicReduction});
+
+          return OMPBuilder.Builder.saveIP();
         } else {
           ReplacementValue = &Inner;
           LLVM_DEBUG(dbgs() << "Shared Inner " << Inner << " -> to -> "
@@ -113,6 +174,19 @@ namespace {
         }
 
         return CodeGenIP;
+      };
+
+      auto BodyGenCB = [&](InsertPointTy AllocaIP, InsertPointTy CodeGenIP,
+                           BasicBlock &ContinuationIP) {
+        BasicBlock *CGStartBB = CodeGenIP.getBlock();
+        BasicBlock *CGEndBB = SplitBlock(CGStartBB, &*CodeGenIP.getPoint());
+        assert(StartBB != nullptr && "StartBB should not be null");
+        CGStartBB->getTerminator()->setSuccessor(0, StartBB);
+        assert(EndBB != nullptr && "EndBB should not be null");
+        EndBB->getTerminator()->setSuccessor(0, CGEndBB);
+
+        BodyIP = InsertPointTy(CGEndBB, CGEndBB->getFirstInsertionPt());
+        BodyAllocaIP = AllocaIP;
       };
 
       IRBuilder<>::InsertPoint AllocaIP(
@@ -136,13 +210,20 @@ namespace {
           Loc, AllocaIP, BodyGenCB, PrivCB, FiniCB,
           /* IfCondition */ IfConditionCast, /* NumThreads */ NumThreads,
           OMP_PROC_BIND_default, /* IsCancellable */ false);
+
+      if (!ReductionInfos.empty())
+        OMPBuilder.createReductions(BodyIP, BodyAllocaIP, ReductionInfos);
+
       BranchInst::Create(AfterBB, AfterIP.getBlock());
     }
 
-    static void emitOMPFor(Module &M, OpenMPIRBuilder &OMPBuilder, Value *IV,
+    static void emitOMPFor(Module &M, OpenMPIRBuilder &OMPBuilder,
+                           MapVector<Value *, DSAType> &DSAValueMap, Value *IV,
                            Value *UB, BasicBlock *PreHeader, BasicBlock *Exit,
-                           OMPScheduleType Sched, Value *Chunk) {
+                           OMPScheduleType Sched, Value *Chunk,
+                           bool IsStandalone) {
       Type *IVTy = IV->getType()->getPointerElementType();
+      SmallVector<OpenMPIRBuilder::ReductionInfo> ReductionInfos;
 
       auto GetKmpcForStaticInit = [&]() -> FunctionCallee {
         LLVM_DEBUG(dbgs() << "Type " << *IVTy << "\n");
@@ -156,7 +237,7 @@ namespace {
               M, OMPRTL___kmpc_for_static_init_8u);
         llvm_unreachable("unknown OpenMP loop iterator bitwidth");
       };
-      // TODO: privatization.
+
       FunctionCallee KmpcForStaticInit = GetKmpcForStaticInit();
       FunctionCallee KmpcForStaticFini = OMPBuilder.getOrCreateRuntimeFunction(
           M, OMPRTL___kmpc_for_static_fini);
@@ -180,6 +261,74 @@ namespace {
           OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_stride");
       Value *PUpperBound =
           OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_ub");
+
+      OpenMPIRBuilder::OutlineInfo OI;
+      OI.EntryBB = PreHeader;
+      OI.ExitBB = Exit;
+      SmallPtrSet<BasicBlock *, 8> BlockSet;
+      SmallVector<BasicBlock *, 8> BlockVector;
+      OI.collectBlocks(BlockSet, BlockVector);
+
+      // Do privatization if standalone.
+      // TODO: create PrivCBHelper and re-use PrivCB from emitOMPParallel.
+      if (IsStandalone)
+        for (auto &It : DSAValueMap) {
+          Value *Orig = It.first;
+          DSAType DSA = It.second;
+          Value *ReplacementValue = nullptr;
+          Type *VTy = Orig->getType()->getPointerElementType();
+
+          if (DSA == DSA_SHARED)
+            continue;
+
+          // Store previous uses to set them to the ReplacementValue after
+          // privatization codegen.
+          SetVector<Use *> Uses;
+          for (Use &U : Orig->uses())
+            if (auto *UserI = dyn_cast<Instruction>(U.getUser()))
+              if (BlockSet.count(UserI->getParent()))
+                Uses.insert(&U);
+
+          OMPBuilder.Builder.restoreIP(AllocaIP);
+          if (DSA == DSA_PRIVATE) {
+            ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+                VTy, /*ArraySize */ nullptr, Orig->getName() + ".for.priv");
+          } else if (DSA == DSA_FIRSTPRIVATE) {
+            Value *V = OMPBuilder.Builder.CreateLoad(
+                VTy, Orig, Orig->getName() + ".for.firstpriv.reload");
+            ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+                VTy, /*ArraySize */ nullptr,
+                Orig->getName() + ".for.firstpriv.copy");
+            OMPBuilder.Builder.CreateStore(V, ReplacementValue);
+            // ReplacementValue = Orig;
+          } else if (DSA == DSA_REDUCTION_ADD) {
+            ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+                VTy, /* ArraySize */ nullptr, Orig->getName() + ".red.priv");
+
+            // Store idempotent value based on operation and type.
+            // TODO: create templated emitInitAndAppendInfo in CGReduction
+            if (VTy->isIntegerTy())
+              OMPBuilder.Builder.CreateStore(ConstantInt::get(VTy, 0),
+                                             ReplacementValue);
+            else if (VTy->isFloatTy() || VTy->isDoubleTy())
+              OMPBuilder.Builder.CreateStore(ConstantFP::get(VTy, 0.0),
+                                             ReplacementValue);
+            else
+              assert(
+                  false &&
+                  "Unsupported type to init with idempotent reduction value");
+
+            ReductionInfos.push_back({Orig, ReplacementValue,
+                                      CGReduction::sumReduction,
+                                      CGReduction::sumAtomicReduction});
+          } else
+            assert(false && "Unsupported privatization");
+
+          assert(ReplacementValue && "Expected non-null ReplacementValue");
+
+          for (Use *UPtr : Uses)
+            UPtr->set(ReplacementValue);
+        }
 
       OMPBuilder.Builder.SetInsertPoint(PreHeader->getTerminator());
 
@@ -224,17 +373,25 @@ namespace {
       Value *UpdateIV = OMPBuilder.Builder.CreateAdd(LoadIV, LowerBound);
       OMPBuilder.Builder.CreateStore(UpdateIV, IV);
 
-      // Add fini call to loop exit block.
-      OMPBuilder.Builder.SetInsertPoint(Exit->getTerminator());
+      // Add fini call, reductions, and barrier after the loop exit block.
+      BasicBlock *FiniBB = SplitBlock(Exit, &*Exit->getFirstInsertionPt());
+      BasicBlock *NextFiniBB = SplitBlock(FiniBB, &*FiniBB->getFirstInsertionPt());
+      OMPBuilder.Builder.SetInsertPoint(FiniBB, FiniBB->getFirstInsertionPt());
       OMPBuilder.Builder.CreateCall(KmpcForStaticFini, {SrcLoc, ThreadNum});
 
-      // Create barrier in exit block.
-      // TODO: only create if not in a combined parallel for directive.
-      OMPBuilder.createBarrier(OpenMPIRBuilder::LocationDescription(
-                                   OMPBuilder.Builder.saveIP(), Loc.DL),
-                               omp::Directive::OMPD_for,
-                               /* ForceSimpleCall */ false,
-                               /* CheckCancelFlag */ false);
+      // Emit reductions, barrier if standalone.
+      if (IsStandalone) {
+        if (!ReductionInfos.empty())
+          OMPBuilder.createReductions(OMPBuilder.Builder.saveIP(), AllocaIP,
+                                      ReductionInfos);
+
+        OMPBuilder.Builder.SetInsertPoint(NextFiniBB->getTerminator());
+        OMPBuilder.createBarrier(OpenMPIRBuilder::LocationDescription(
+                                     OMPBuilder.Builder.saveIP(), Loc.DL),
+                                 omp::Directive::OMPD_for,
+                                 /* ForceSimpleCall */ false,
+                                 /* CheckCancelFlag */ false);
+      }
     }
 
     static void emitOMPTask(Module &M, OpenMPIRBuilder &OMPBuilder,
@@ -557,6 +714,8 @@ namespace {
           StringRef Tag = O.getTag();
           LLVM_DEBUG(dbgs() << "OPB " << Tag << "\n");
 
+          // TODO: check for conflicting DSA, for example reduction variables
+          // cannot be set private. Should be done in Numba.
           if (Tag.startswith("DIR")) {
             auto It = StringToDir.find(Tag);
             assert(It != StringToDir.end() && "Directive is not supported!");
@@ -597,6 +756,8 @@ namespace {
                 assert(O.input_size() == 1 &&
                        "Expected single if condition value");
                 ParRegionInfo.IfCondition = V;
+              } else if (Tag.startswith("QUAL.OMP.REDUCTION.ADD")) {
+                DSAValueMap[V] = DSA_REDUCTION_ADD;
               } else /* DSA Qualifiers */ {
                 auto It = StringToDSA.find(Tag);
                 assert(It != StringToDSA.end() && "DSA type not found in map");
@@ -652,9 +813,9 @@ namespace {
         CBEntry->eraseFromParent();
 
         if (Dir == OMPD_parallel) {
-          emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, AfterBB,
-                          BodyGenCB, FiniCB, ParRegionInfo.IfCondition,
-                          ParRegionInfo.NumThreads);
+          emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, StartBB,
+                          EndBB, AfterBB, FiniCB,
+                          ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
 
           LLVM_DEBUG(dbgs() << "=== Before Fn\n" << *Fn << "=== End of Before Fn\n");
           OMPBuilder.finalize(Fn, /* AllowExtractorSinking */ true);
@@ -699,15 +860,16 @@ namespace {
 
           BasicBlock *PreHeader = StartBB;
           BasicBlock *Header = PreHeader->getUniqueSuccessor();
-          BasicBlock *Exit = EndBB;
+          BasicBlock *Exit = BBExit;
           assert(Header &&
                  "Expected unique successor from PreHeader to Header");
           LLVM_DEBUG(dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n");
           LLVM_DEBUG(dbgs() << "=== Header\n" << *Header << "=== End of Header\n");
           LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
 
-          emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
-                     Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
+          emitOMPFor(M, OMPBuilder, DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB,
+                     PreHeader, Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk,
+                     /* IsStandalone */ true);
           LLVM_DEBUG(dbgs() << "=== For Fn\n" << *Fn << "=== End of For Fn\n");
         } else if (Dir == OMPD_parallel_for) {
           // TODO: Verify the DSA for IV, UB since they are implicit in the
@@ -721,17 +883,17 @@ namespace {
 
           BasicBlock *PreHeader = StartBB;
           BasicBlock *Header = PreHeader->getUniqueSuccessor();
-          BasicBlock *Exit = EndBB;
+          BasicBlock *Exit = BBExit;
           assert(Header &&
                  "Expected unique successor from PreHeader to Header");
           LLVM_DEBUG(dbgs() << "=== PreHeader\n" << *PreHeader << "=== End of PreHeader\n");
           LLVM_DEBUG(dbgs() << "=== Header\n" << *Header << "=== End of Header\n");
           LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
-          emitOMPFor(M, OMPBuilder, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
-                     Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk);
-          emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, AfterBB,
-                          BodyGenCB, FiniCB, ParRegionInfo.IfCondition,
-                          ParRegionInfo.NumThreads);
+          emitOMPFor(M, OMPBuilder, DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB, PreHeader,
+                     Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk, /* IsStandalone */ false);
+          emitOMPParallel(OMPBuilder, DSAValueMap, DL, Fn, BBEntry, StartBB,
+                          EndBB, AfterBB, FiniCB,
+                          ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
           OMPBuilder.finalize(Fn, /* AllowExtractorSinking */ true);
         } else if (Dir == OMPD_task) {
           emitOMPTask(M, OMPBuilder, DSAValueMap, Fn, BBEntry, StartBB, EndBB,
