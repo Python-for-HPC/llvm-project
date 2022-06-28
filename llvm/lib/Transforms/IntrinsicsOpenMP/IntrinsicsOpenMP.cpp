@@ -51,7 +51,8 @@ namespace {
       {"DIR.OMP.LOOP", OMPD_for},
       {"DIR.OMP.PARALLEL.LOOP", OMPD_parallel_for},
       {"DIR.OMP.TASK", OMPD_task},
-      {"DIR.OMP.TASKWAIT", OMPD_taskwait}
+      {"DIR.OMP.TASKWAIT", OMPD_taskwait},
+      {"DIR.OMP.TARGET", OMPD_target}
   };
 
   // TODO: add more reduction operators.
@@ -905,6 +906,8 @@ namespace {
               DL);
 
           OMPBuilder.createTaskwait(Loc);
+        } else if (Dir == OMPD_target) {
+          LLVM_DEBUG(dbgs() << "TODO target\n");
         } else {
           LLVM_DEBUG(dbgs() << "Unknown directive " << *CBEntry << "\n");
           assert(false && "Unknown directive");
