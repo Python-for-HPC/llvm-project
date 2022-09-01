@@ -736,8 +736,6 @@ namespace {
                 assert(O.input_size() == 1 &&
                        "Expected single NumThreads value");
                 ParRegionInfo.NumThreads = V;
-                // TODO: Check DSA value for NumThreads value.
-                DSAValueMap[V] = DSA_FIRSTPRIVATE;
               } else if (Tag.startswith("QUAL.OMP.SCHEDULE")) {
                 assert(O.input_size() == 1 &&
                        "Expected single chunking scheduling value");
