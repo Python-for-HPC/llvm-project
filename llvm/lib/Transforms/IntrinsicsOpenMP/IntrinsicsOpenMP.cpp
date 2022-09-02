@@ -196,11 +196,15 @@ namespace {
       // Set the insertion location at the end of the BBEntry.
       BBEntry->getTerminator()->eraseFromParent();
 
-      Value *IfConditionCast = nullptr;
+      Value *IfConditionEval = nullptr;
       if (IfCondition) {
         OMPBuilder.Builder.SetInsertPoint(BBEntry);
-        IfConditionCast = OMPBuilder.Builder.CreateIntCast(
-            IfCondition, OMPBuilder.Builder.getInt1Ty(), /* isSigned */ false);
+        if (IfCondition->getType()->isFloatingPointTy())
+          IfConditionEval = OMPBuilder.Builder.CreateFCmpUNE(
+              IfCondition, ConstantFP::get(IfCondition->getType(), 0));
+        else
+          IfConditionEval = OMPBuilder.Builder.CreateICmpNE(
+              IfCondition, ConstantInt::get(IfCondition->getType(), 0));
       }
 
       OpenMPIRBuilder::LocationDescription Loc(
@@ -209,7 +213,7 @@ namespace {
       // TODO: support cancellable, binding.
       InsertPointTy AfterIP = OMPBuilder.createParallel(
           Loc, AllocaIP, BodyGenCB, PrivCB, FiniCB,
-          /* IfCondition */ IfConditionCast, /* NumThreads */ NumThreads,
+          /* IfCondition */ IfConditionEval, /* NumThreads */ NumThreads,
           OMP_PROC_BIND_default, /* IsCancellable */ false);
 
       if (!ReductionInfos.empty())
