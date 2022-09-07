@@ -21,9 +21,10 @@
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IntrinsicsOpenMP/IntrinsicsOpenMP.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/IntrinsicsOpenMP/IntrinsicsOpenMP.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
 using namespace omp;
@@ -103,6 +104,8 @@ namespace {
   struct IntrinsicsOpenMP: public ModulePass {
     static char ID; // Pass identification, replacement for typeid
     IntrinsicsOpenMP() : ModulePass(ID) {}
+
+    StructType *TgtOffloadEntryTy = nullptr;
 
     static void emitOMPParallel(OpenMPIRBuilder &OMPBuilder,
                                 MapVector<Value *, DSAType> &DSAValueMap,
@@ -670,6 +673,38 @@ namespace {
       }
     }
 
+    static void emitOMPOffloadingEntry(Module &M, OpenMPIRBuilder &OMPBuilder,
+                                       StructType *TgtOffloadEntryTy,
+                                       ConstantDataArray *DevFuncName,
+                                       Value *EntryPtr,
+                                       Constant *&OMPOffloadEntry) {
+
+      auto *GV = new GlobalVariable(
+          M, DevFuncName->getType(), /* isConstant */ true,
+          GlobalValue::InternalLinkage, DevFuncName,
+          ".omp_offloading.entry_name", nullptr, GlobalVariable::NotThreadLocal,
+          /* AddressSpace */ 0);
+      GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
+      Constant *EntryConst = dyn_cast<Constant>(EntryPtr);
+      assert(EntryConst && "Expected constant entry pointer");
+      OMPOffloadEntry =
+          ConstantStruct::get(TgtOffloadEntryTy,
+                              ConstantExpr::getPointerBitCastOrAddrSpaceCast(
+                                  EntryConst, OMPBuilder.VoidPtr),
+                              ConstantExpr::getPointerBitCastOrAddrSpaceCast(
+                                  GV, OMPBuilder.Int8Ptr),
+                              ConstantInt::get(OMPBuilder.SizeTy, 0),
+                              ConstantInt::get(OMPBuilder.Int32, 0),
+                              ConstantInt::get(OMPBuilder.Int32, 0));
+      auto *OMPOffloadEntryGV = new GlobalVariable(
+          M, TgtOffloadEntryTy,
+          /* isConstant */ true, GlobalValue::WeakAnyLinkage, OMPOffloadEntry,
+          ".omp_offloading.entry." + DevFuncName->getAsString());
+      OMPOffloadEntryGV->setSection("omp_offloading_entries");
+      OMPOffloadEntryGV->setAlignment(Align(1));
+    }
+
     bool runOnModule(Module &M) override {
       LLVM_DEBUG(dbgs() << "=== Start IntrinsicsOpenMPPass v4\n");
 
@@ -683,6 +718,17 @@ namespace {
 
       OpenMPIRBuilder OMPBuilder(M);
       OMPBuilder.initialize();
+
+      // Types
+      // TODO: fix naming, why .0 is added at the end?
+      if (!TgtOffloadEntryTy) {
+        TgtOffloadEntryTy = StructType::create(
+            {OMPBuilder.Int8Ptr, OMPBuilder.Int8Ptr, OMPBuilder.SizeTy,
+             OMPBuilder.Int32, OMPBuilder.Int32},
+            "struct.__tgt_offload_entry");
+      }
+      // Outer scoped variables: TODO fix
+      GlobalVariable *OMPOffloadEntries = nullptr;
 
       LLVM_DEBUG(dbgs() << "=== Dump module\n" << M << "=== End of Dump module\n");
 
@@ -712,6 +758,11 @@ namespace {
           Value *NumThreads = nullptr;
           Value *IfCondition = nullptr;
         } ParRegionInfo;
+
+        // TODO: Fix scoping under an info struct.
+        GlobalVariable *OMPRegionId;
+
+        bool IsOpenMPDevice = false;
 
         CBEntry->getOperandBundlesAsDefs(OpBundles);
         // TODO: parse clauses.
@@ -761,12 +812,198 @@ namespace {
                 ParRegionInfo.IfCondition = V;
               } else if (Tag.startswith("QUAL.OMP.REDUCTION.ADD")) {
                 DSAValueMap[V] = DSA_REDUCTION_ADD;
+              }
+              else if (Tag.startswith("QUAL.OMP.TARGET.DEV_FUNC")) {
+                assert(O.input_size() == 1 &&
+                       "Expected a single device function name");
+                ConstantDataArray *DevFuncName = dyn_cast<ConstantDataArray>(V);
+                assert(DevFuncName && "Expected constant string for the device function");
+
+                OMPRegionId = new GlobalVariable(
+                    M, OMPBuilder.Int8, /* isConstant */ true,
+                    GlobalValue::WeakAnyLinkage,
+                    ConstantInt::get(OMPBuilder.Int8, 0),
+                    DevFuncName->getAsString() + ".region_id", nullptr,
+                    GlobalVariable::NotThreadLocal, /* AddressSpace */ 0);
+
+                Constant *OMPOffloadEntry;
+                emitOMPOffloadingEntry(M, OMPBuilder, TgtOffloadEntryTy,
+                                       DevFuncName, OMPRegionId,
+                                       OMPOffloadEntry);
+
+                // TODO: do this at finalization when all entries have been found.
+                auto *ArrayTy = ArrayType::get(TgtOffloadEntryTy, 1);
+                OMPOffloadEntries = new GlobalVariable(
+                    M, ArrayTy,
+                    /* isConstant */ true, GlobalValue::ExternalLinkage,
+                    ConstantArray::get(ArrayTy, {OMPOffloadEntry}),
+                    ".omp_offloading.entries");
+
+              } else if (Tag.startswith("QUAL.OMP.TARGET.ELF")) {
+                assert(O.input_size() == 1 &&
+                       "Expected a single elf image string");
+                ConstantDataArray *ELFConstant = dyn_cast<ConstantDataArray>(V);
+                assert(ELFConstant && "Expected constant string for ELF");
+                auto *GV = new GlobalVariable(
+                    M, ELFConstant->getType(), /* isConstant */ true,
+                    GlobalValue::InternalLinkage, ELFConstant,
+                    ".omp_offloading.device_image");
+                GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
+                StructType *TgtDeviceImageTy =
+                    StructType::create({OMPBuilder.Int8Ptr, OMPBuilder.Int8Ptr,
+                                        TgtOffloadEntryTy->getPointerTo(),
+                                        TgtOffloadEntryTy->getPointerTo()},
+                                       "struct.__tgt_device_image");
+
+                StructType *TgtBinDescTy = StructType::create(
+                    {OMPBuilder.Int32, TgtDeviceImageTy->getPointerTo(),
+                     TgtOffloadEntryTy->getPointerTo(),
+                     TgtOffloadEntryTy->getPointerTo()},
+                    "struct.__tgt_bin_desc");
+
+                auto *ArrayTy = ArrayType::get(TgtDeviceImageTy, 1);
+                auto *Zero = ConstantInt::get(OMPBuilder.SizeTy, 0);
+                auto *One = ConstantInt::get(OMPBuilder.SizeTy, 1);
+                auto *Size = ConstantInt::get(OMPBuilder.SizeTy, ELFConstant->getNumElements());
+                Constant *ZeroZero[] = {Zero, Zero};
+                Constant *ZeroOne[] = {Zero, One};
+                Constant *ZeroSize[] = {Zero, Size};
+
+                auto *ImageB = ConstantExpr::getGetElementPtr(
+                    GV->getValueType(), GV, ZeroZero);
+                auto *ImageE = ConstantExpr::getGetElementPtr(
+                                            GV->getValueType(), GV, ZeroSize);
+                auto *EntriesB = ConstantExpr::getGetElementPtr(
+                                            OMPOffloadEntries->getValueType(),
+                                            OMPOffloadEntries, ZeroZero);
+                auto *EntriesE = ConstantExpr::getGetElementPtr(
+                                            OMPOffloadEntries->getValueType(),
+                                            OMPOffloadEntries, ZeroOne);
+
+                auto *DeviceImageEntry = ConstantStruct::get(
+                    TgtDeviceImageTy, ImageB, ImageE, EntriesB, EntriesE);
+                auto *DeviceImages = new GlobalVariable(
+                    M, ArrayTy,
+                    /* isConstant */ true, GlobalValue::InternalLinkage,
+                    ConstantArray::get(ArrayTy, {DeviceImageEntry}),
+                    ".omp_offloading.device_images");
+
+                auto *ImagesB = ConstantExpr::getGetElementPtr(
+                    DeviceImages->getValueType(), DeviceImages, ZeroZero);
+                auto *DescInit = ConstantStruct::get(
+                    TgtBinDescTy,
+                    ConstantInt::get(OMPBuilder.Int32,
+                                     /* number of images */ 1),
+                    ImagesB, EntriesB, EntriesE);
+                auto *BinDesc = new GlobalVariable(M, DescInit->getType(),
+                                   /* isConstant */ true,
+                                   GlobalValue::InternalLinkage, DescInit,
+                                   ".omp_offloading.descriptor");
+
+                // Add tgt_register_requires, tgt_register_lib, tgt_unregister_lib.
+                {
+                  // tgt_register_requires.
+                  auto *FuncTy =
+                      FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
+                  auto *Func =
+                      Function::Create(FuncTy, GlobalValue::InternalLinkage,
+                                       ".omp_offloading.requires_reg", &M);
+                  Func->setSection(".text.startup");
+
+                  // Get __tgt_register_lib function declaration.
+                  auto *RegFuncTy =
+                      FunctionType::get(OMPBuilder.Void, OMPBuilder.Int64,
+                                        /*isVarArg*/ false);
+                  FunctionCallee RegFuncC =
+                      M.getOrInsertFunction("__tgt_register_requires", RegFuncTy);
+
+                  // Construct function body
+                  IRBuilder<> Builder(
+                      BasicBlock::Create(M.getContext(), "entry", Func));
+                  // TODO: fix to pass the requirement number.
+                  Builder.CreateCall(RegFuncC,
+                                     ConstantInt::get(OMPBuilder.Int64, 1));
+                  Builder.CreateRetVoid();
+
+                  // Add this function to constructors.
+                  // Set priority to 1 so that __tgt_register_lib is executed
+                  // AFTER
+                  // __tgt_register_requires (we want to know what requirements
+                  // have been asked for before we load a libomptarget plugin so
+                  // that by the time the plugin is loaded it can report how
+                  // many devices there are which can satisfy these
+                  // requirements).
+                  appendToGlobalCtors(M, Func, /*Priority*/ 0);
+                }
+                {
+                  // ctor
+                  auto *FuncTy =
+                      FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
+                  auto *Func =
+                      Function::Create(FuncTy, GlobalValue::InternalLinkage,
+                                       ".omp_offloading.descriptor_reg", &M);
+                  Func->setSection(".text.startup");
+
+                  // Get __tgt_register_lib function declaration.
+                  auto *RegFuncTy = FunctionType::get(
+                      OMPBuilder.Void, TgtBinDescTy->getPointerTo(),
+                      /*isVarArg*/ false);
+                  FunctionCallee RegFuncC =
+                      M.getOrInsertFunction("__tgt_register_lib", RegFuncTy);
+
+                  // Construct function body
+                  IRBuilder<> Builder(
+                      BasicBlock::Create(M.getContext(), "entry", Func));
+                  Builder.CreateCall(RegFuncC, BinDesc);
+                  Builder.CreateRetVoid();
+
+                  // Add this function to constructors.
+                  // Set priority to 1 so that __tgt_register_lib is executed
+                  // AFTER
+                  // __tgt_register_requires (we want to know what requirements
+                  // have been asked for before we load a libomptarget plugin so
+                  // that by the time the plugin is loaded it can report how
+                  // many devices there are which can satisfy these
+                  // requirements).
+                  appendToGlobalCtors(M, Func, /*Priority*/ 1);
+                }
+                {
+                  auto *FuncTy =
+                      FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
+                  auto *Func =
+                      Function::Create(FuncTy, GlobalValue::InternalLinkage,
+                                       ".omp_offloading.descriptor_unreg", &M);
+                  Func->setSection(".text.startup");
+
+                  // Get __tgt_unregister_lib function declaration.
+                  auto *UnRegFuncTy = FunctionType::get(
+                      OMPBuilder.Void, TgtBinDescTy->getPointerTo(),
+                      /*isVarArg*/ false);
+                  FunctionCallee UnRegFuncC = M.getOrInsertFunction(
+                      "__tgt_unregister_lib", UnRegFuncTy);
+
+                  // Construct function body
+                  IRBuilder<> Builder(
+                      BasicBlock::Create(M.getContext(), "entry", Func));
+                  Builder.CreateCall(UnRegFuncC, BinDesc);
+                  Builder.CreateRetVoid();
+
+                  // Add this function to global destructors.
+                  // Match priority of __tgt_register_lib
+                  appendToGlobalDtors(M, Func, /*Priority*/ 1);
+                }
               } else /* DSA Qualifiers */ {
                 auto It = StringToDSA.find(Tag);
                 assert(It != StringToDSA.end() && "DSA type not found in map");
                 DSAValueMap[V] = It->second;
               }
             }
+          }
+          else {
+            // TODO: remove special handler for OMP.DEVICE, make it a qualifier,
+            // error-check that OPBs are recognized.
+            IsOpenMPDevice = true;
           }
         }
 
@@ -909,7 +1146,45 @@ namespace {
 
           OMPBuilder.createTaskwait(Loc);
         } else if (Dir == OMPD_target) {
-          LLVM_DEBUG(dbgs() << "TODO target\n");
+          // TODO: remove this special check that comes from the OMP.DEVICE tag
+          // and generalize. We only need to generate offloading entries.
+          if (IsOpenMPDevice) {
+            Constant *DevFuncNameConstant = ConstantDataArray::getString(
+                M.getContext(), BBEntry->getParent()->getName(), false);
+            ConstantDataArray *DevFuncName =
+                cast<ConstantDataArray>(DevFuncNameConstant);
+            Constant *OMPOffloadEntry;
+            emitOMPOffloadingEntry(M, OMPBuilder, TgtOffloadEntryTy,
+                                   DevFuncName, BBEntry->getParent(),
+                                   OMPOffloadEntry);
+            continue;
+          }
+
+          const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
+          OpenMPIRBuilder::LocationDescription Loc(
+              InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()),
+              DL);
+          Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+          Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
+
+          FunctionCallee TargetMapper = OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_mapper);
+          OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
+          auto *OffloadResult = OMPBuilder.Builder.CreateCall(
+              TargetMapper,
+              {SrcLoc, ConstantInt::get(OMPBuilder.Int64, -1),
+               ConstantExpr::getBitCast(
+                   OMPRegionId,
+                   OMPBuilder.Int8Ptr),
+               ConstantInt::get(OMPBuilder.Int32, 0),
+               Constant::getNullValue(OMPBuilder.VoidPtrPtr),
+               Constant::getNullValue(OMPBuilder.VoidPtrPtr),
+               Constant::getNullValue(OMPBuilder.Int64Ptr),
+               Constant::getNullValue(OMPBuilder.Int64Ptr),
+               Constant::getNullValue(OMPBuilder.VoidPtrPtr),
+               Constant::getNullValue(OMPBuilder.VoidPtrPtr)});
+          auto *Failed = OMPBuilder.Builder.CreateIsNotNull(OffloadResult);
+          OMPBuilder.Builder.CreateCondBr(Failed, StartBB, EndBB);
+          BBEntry->getTerminator()->eraseFromParent();
         } else {
           LLVM_DEBUG(dbgs() << "Unknown directive " << *CBEntry << "\n");
           assert(false && "Unknown directive");
