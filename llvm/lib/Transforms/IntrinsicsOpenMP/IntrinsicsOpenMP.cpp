@@ -794,9 +794,9 @@ namespace {
           MapType = 0;
         }
 
-        dbgs() << "Mapping found for Value " << *V << " map type " << DSA
+        LLVM_DEBUG(dbgs() << "Mapping found for Value " << *V << " map type " << DSA
                << " map size "
-               << M.getDataLayout().getTypeAllocSize(V->getType()) << "\n";
+               << M.getDataLayout().getTypeAllocSize(V->getType()) << "\n");
 
         auto Size = M.getDataLayout().getTypeAllocSize(V->getType());
         // TODO: assumes a scalar for now. Fix for pointers, fix for
