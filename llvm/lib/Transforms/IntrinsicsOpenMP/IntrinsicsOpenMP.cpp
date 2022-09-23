@@ -181,8 +181,10 @@ namespace {
           Type *VTy = Inner.getType()->getPointerElementType();
           ReplacementValue = OMPBuilder.Builder.CreateAlloca(
               VTy, /*ArraySize */ nullptr, Inner.getName());
+          OMPBuilder.Builder.CreateStore(Constant::getNullValue(VTy),
+                                         ReplacementValue);
           LLVM_DEBUG(dbgs() << "Privatizing Inner " << Inner << " -> to -> "
-                 << *ReplacementValue << "\n");
+                            << *ReplacementValue << "\n");
         } else if (DSA == DSA_FIRSTPRIVATE) {
           OMPBuilder.Builder.restoreIP(AllocaIP);
           Type *VTy = Inner.getType()->getPointerElementType();
@@ -345,6 +347,8 @@ namespace {
           if (DSA == DSA_PRIVATE) {
             ReplacementValue = OMPBuilder.Builder.CreateAlloca(
                 VTy, /*ArraySize */ nullptr, Orig->getName() + ".for.priv");
+            OMPBuilder.Builder.CreateStore(Constant::getNullValue(VTy),
+                                           ReplacementValue);
           } else if (DSA == DSA_FIRSTPRIVATE) {
             Value *V = OMPBuilder.Builder.CreateLoad(
                 VTy, Orig, Orig->getName() + ".for.firstpriv.reload");
