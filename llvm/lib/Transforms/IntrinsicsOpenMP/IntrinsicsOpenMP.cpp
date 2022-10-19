@@ -42,7 +42,12 @@ namespace {
     DSA_FIRSTPRIVATE,
     DSA_SHARED,
     DSA_REDUCTION_ADD,
-    DSA_MAP_TOFROM
+    DSA_MAP_TO,
+    DSA_MAP_FROM,
+    DSA_MAP_TOFROM,
+    DSA_MAP_TO_STRUCT,
+    DSA_MAP_FROM_STRUCT,
+    DSA_MAP_TOFROM_STRUCT
   };
 
   static const DenseMap<StringRef, Directive> StringToDir = {
@@ -63,7 +68,12 @@ namespace {
       {"QUAL.OMP.FIRSTPRIVATE", DSA_FIRSTPRIVATE},
       {"QUAL.OMP.SHARED", DSA_SHARED},
       {"QUAL.OMP.REDUCTION.ADD", DSA_REDUCTION_ADD},
-      {"QUAL.OMP.MAP.TOFROM", DSA_MAP_TOFROM}
+      {"QUAL.OMP.MAP.TO", DSA_MAP_TO},
+      {"QUAL.OMP.MAP.FROM", DSA_MAP_FROM},
+      {"QUAL.OMP.MAP.TOFROM", DSA_MAP_TOFROM},
+      {"QUAL.OMP.MAP.TO.STRUCT", DSA_MAP_TO_STRUCT},
+      {"QUAL.OMP.MAP.FROM.STRUCT", DSA_MAP_FROM_STRUCT},
+      {"QUAL.OMP.MAP.TOFROM.STRUCT", DSA_MAP_TOFROM_STRUCT}
   };
 
   /// Data attributes for each data reference used in an OpenMP target region.
@@ -139,6 +149,13 @@ namespace {
     Value *MapNames;
     Value *BasePtrs;
     Value *Ptrs;
+    size_t Size;
+  };
+
+  struct FieldMappingInfo {
+    Value *Index;
+    Value *Offset;
+    Value *NumElements;
   };
 
   using InsertPointTy = OpenMPIRBuilder::InsertPointTy;
@@ -756,14 +773,20 @@ namespace {
       OMPOffloadEntryGV->setAlignment(Align(1));
     }
 
-    void
-    emitOMPOffloadingMappings(Module &M, OpenMPIRBuilder &OMPBuilder,
-                              InsertPointTy AllocaIP,
-                              MapVector<Value *, DSAType> &DSAValueMap,
-                              OffloadingMappingArgsTy &OffloadingMappingArgs) {
-      SmallVector<Value *, 8> OffloadBasePtrs;
-      SmallVector<Value *, 8> OffloadPtrs;
-      SmallVector<Constant *, 8> OffloadSizes;
+    void emitOMPOffloadingMappings(
+        Module &M, OpenMPIRBuilder &OMPBuilder, InsertPointTy AllocaIP,
+        MapVector<Value *, DSAType> &DSAValueMap,
+        MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+        OffloadingMappingArgsTy &OffloadingMappingArgs) {
+
+      struct MapperInfo {
+        Value *BasePtr;
+        Value *Ptr;
+        Value *Size;
+      };
+
+      SmallVector<MapperInfo, 8> MapperInfos;
+      //SmallVector<Constant *, 8> OffloadSizes;
       SmallVector<Constant *, 8> OffloadMapTypes;
       SmallVector<Constant *, 8> OffloadMapNames;
 
@@ -777,37 +800,133 @@ namespace {
         return;
       }
 
+      auto EmitMappingEntry = [&](Value *Size, uint64_t MapType, Value *BasePtr,
+                                  Value *Ptr) {
+        OffloadMapTypes.push_back(ConstantInt::get(OMPBuilder.SizeTy, MapType));
+        // TODO: maybe add debug info.
+        OffloadMapNames.push_back(
+            OMPBuilder.getOrCreateSrcLocStr(BasePtr->getName(), "", 0, 0));
+        MapperInfos.push_back({BasePtr, Ptr, Size});
+      };
+
+      // Keep track of argument position, needed for struct mappings.
       for (auto &It : DSAValueMap) {
         Value *V = It.first;
         DSAType DSA = It.second;
         uint64_t MapType = 0;
 
+        // Determine the map type, completely or partly (structs).
         switch (DSA) {
         case DSA_FIRSTPRIVATE:
           MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_LITERAL;
           break;
+        case DSA_MAP_TO:
+          MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_TO;
+          break;
+        case DSA_MAP_FROM:
+          MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_FROM;
+          break;
         case DSA_MAP_TOFROM:
           MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_TO |
-                    OMP_TGT_MAPTYPE_FROM;
+                     OMP_TGT_MAPTYPE_FROM;
+          break;
+        case DSA_MAP_TO_STRUCT:
+          MapType = OMP_TGT_MAPTYPE_TO;
+          break;
+        case DSA_MAP_FROM_STRUCT:
+          MapType = OMP_TGT_MAPTYPE_FROM;
+          break;
+        case DSA_MAP_TOFROM_STRUCT:
+          MapType = OMP_TGT_MAPTYPE_TO | OMP_TGT_MAPTYPE_FROM;
+          break;
+        case DSA_PRIVATE:
+          // do nothing
           break;
         default:
-          MapType = 0;
+          assert(false && "Unknown mapping type");
+          report_fatal_error("Unknown mapping type");
         }
 
-        LLVM_DEBUG(dbgs() << "Mapping found for Value " << *V << " map type " << DSA
-               << " map size "
-               << M.getDataLayout().getTypeAllocSize(V->getType()) << "\n");
+        // Emit the mapping entry.
+        Value *Size;
+        switch (DSA) {
+        case DSA_MAP_TO:
+        case DSA_MAP_FROM:
+        case DSA_MAP_TOFROM:
+        case DSA_FIRSTPRIVATE:
+          Size = ConstantInt::get(
+              OMPBuilder.SizeTy,
+              M.getDataLayout().getTypeAllocSize(V->getType()));
+          EmitMappingEntry(Size, MapType, V, V);
+          break;
+        case DSA_MAP_TO_STRUCT:
+        case DSA_MAP_FROM_STRUCT:
+        case DSA_MAP_TOFROM_STRUCT: {
+          Size = ConstantInt::get(
+              OMPBuilder.SizeTy, M.getDataLayout().getTypeAllocSize(
+                                     V->getType()->getPointerElementType()));
+          EmitMappingEntry(Size, OMP_TGT_MAPTYPE_TARGET_PARAM, V, V);
+          // Stores the argument position (starting from 1) of the parent
+          // struct, to be used to set MEMBER_OF in the map type.
+          size_t ArgPos = MapperInfos.size();
 
-        auto Size = M.getDataLayout().getTypeAllocSize(V->getType());
-        // TODO: assumes a scalar for now. Fix for pointers, fix for
-        // arrays/range modifiers.
-        OffloadSizes.push_back(ConstantInt::get(OMPBuilder.SizeTy, Size));
-        OffloadMapTypes.push_back(ConstantInt::get(OMPBuilder.SizeTy, MapType));
-        // TODO: maybe add debug info.
-        OffloadMapNames.push_back(
-            OMPBuilder.getOrCreateSrcLocStr(V->getName(), "", 0, 0));
-        OffloadBasePtrs.push_back(V);
-        OffloadPtrs.push_back(V);
+          for (auto &FieldInfo : StructMappingInfoMap[V]) {
+            // MEMBER_OF(Argument Position)
+            const size_t MemberOfOffset = 48;
+            uint64_t MemberOfBits = ArgPos << MemberOfOffset;
+            uint64_t FieldMapType = MapType | MemberOfBits;
+            auto *FieldGEP = OMPBuilder.Builder.CreateInBoundsGEP(
+                V->getType()->getPointerElementType(), V,
+                {OMPBuilder.Builder.getInt32(0), FieldInfo.Index});
+
+            Value *BasePtr = nullptr;
+            Value *Ptr = nullptr;
+
+            if (FieldGEP->getType()->getPointerElementType()->isPointerTy()) {
+              FieldMapType |= OMP_TGT_MAPTYPE_PTR_AND_OBJ;
+              BasePtr = FieldGEP;
+              auto *Load = OMPBuilder.Builder.CreateLoad(
+                  BasePtr->getType()->getPointerElementType(), BasePtr);
+              Ptr = OMPBuilder.Builder.CreateInBoundsGEP(
+                  Load->getType()->getPointerElementType(), Load,
+                  FieldInfo.Offset);
+            }
+            else {
+              BasePtr = V;
+              Ptr = OMPBuilder.Builder.CreateInBoundsGEP(
+                  FieldGEP->getType()->getPointerElementType(), FieldGEP,
+                  FieldInfo.Offset);
+            }
+
+            assert(BasePtr && "Expected non-null base pointer");
+            assert(Ptr && "Expected non-null pointer");
+
+            auto ElementSize =
+                ConstantInt::get(OMPBuilder.SizeTy,
+                                 M.getDataLayout().getTypeAllocSize(
+                                     Ptr->getType()->getPointerElementType()));
+            Value *NumElements = nullptr;
+
+            // Load the value of NumElements if it is a pointer.
+            if (FieldInfo.NumElements->getType()->isPointerTy())
+              NumElements = OMPBuilder.Builder.CreateLoad(
+                  OMPBuilder.SizeTy, FieldInfo.NumElements);
+            else
+              NumElements = FieldInfo.NumElements;
+
+            auto *Size = OMPBuilder.Builder.CreateMul(ElementSize, NumElements);
+            EmitMappingEntry(Size, FieldMapType, BasePtr, Ptr);
+          }
+          break;
+        }
+        case DSA_PRIVATE: {
+          // do nothing
+          break;
+        }
+        default:
+          assert(false && "Unknown mapping type");
+          report_fatal_error("Unknown mapping type");
+        }
       }
 
       auto EmitConstantArrayGlobalBitCast =
@@ -824,9 +943,11 @@ namespace {
             return OMPBuilder.Builder.CreateBitCast(GV, DestTy);
           };
 
-      OffloadingMappingArgs.Sizes =
-          EmitConstantArrayGlobalBitCast(OffloadSizes, OMPBuilder.SizeTy,
-                                  OMPBuilder.Int64Ptr, ".offload_sizes");
+      // TODO: offload_sizes can be a global of constants for optimization if all sizes
+      // are constants.
+      //OffloadingMappingArgs.Sizes =
+      //    EmitConstantArrayGlobalBitCast(OffloadSizes, OMPBuilder.SizeTy,
+      //                            OMPBuilder.Int64Ptr, ".offload_sizes");
       OffloadingMappingArgs.MapTypes =
           EmitConstantArrayGlobalBitCast(OffloadMapTypes, OMPBuilder.SizeTy,
                                   OMPBuilder.Int64Ptr, ".offload_maptypes");
@@ -834,37 +955,72 @@ namespace {
           EmitConstantArrayGlobalBitCast(OffloadMapNames, OMPBuilder.Int8Ptr,
                                   OMPBuilder.VoidPtrPtr, ".offload_mapnames");
 
-      auto EmitArrayAllocaBitCast =
-          [&M, &OMPBuilder, &AllocaIP](ArrayRef<Value *> Ptrs, Type *Ty, StringRef Name) {
+      auto EmitArrayAlloca =
+          [&M, &OMPBuilder, &AllocaIP](size_t Size, Type *Ty, StringRef Name) {
             InsertPointTy CodeGenIP = OMPBuilder.Builder.saveIP();
 
             OMPBuilder.Builder.restoreIP(AllocaIP);
             auto *Alloca = OMPBuilder.Builder.CreateAlloca(
-                ArrayType::get(OMPBuilder.Int8Ptr, Ptrs.size()), nullptr, Name);
+                ArrayType::get(Ty, Size), nullptr, Name);
 
             OMPBuilder.Builder.restoreIP(CodeGenIP);
 
-            int Idx = 0;
-            for (auto &V : Ptrs) {
-              auto *GEP = OMPBuilder.Builder.CreateInBoundsGEP(
-                  Alloca->getType()->getPointerElementType(),
-                  Alloca,
-                  {OMPBuilder.Builder.getInt32(0),
-                   OMPBuilder.Builder.getInt32(Idx)});
-              auto *Bitcast = OMPBuilder.Builder.CreateBitCast(
-                  GEP, V->getType()->getPointerTo());
-              OMPBuilder.Builder.CreateStore(V, Bitcast);
-              Idx++;
-            }
-
-            return OMPBuilder.Builder.CreateBitCast(Alloca,
-                                                    OMPBuilder.VoidPtrPtr);
+            return Alloca;
           };
 
-      OffloadingMappingArgs.BasePtrs = EmitArrayAllocaBitCast(
-          OffloadBasePtrs, OMPBuilder.VoidPtr, ".offload_baseptrs");
-      OffloadingMappingArgs.Ptrs = EmitArrayAllocaBitCast(
-          OffloadPtrs, OMPBuilder.VoidPtr, ".offload_ptrs");
+      auto *BasePtrsAlloca =
+          EmitArrayAlloca(MapperInfos.size(), OMPBuilder.VoidPtr, ".offload_baseptrs");
+      auto *PtrsAlloca =
+          EmitArrayAlloca(MapperInfos.size(), OMPBuilder.VoidPtr, ".offload_ptrs");
+      auto *SizesAlloca =
+          EmitArrayAlloca(MapperInfos.size(), OMPBuilder.SizeTy, ".offload_sizes");
+
+      size_t Idx = 0;
+      for (auto &MI : MapperInfos) {
+        // Store in the base pointers alloca.
+        auto *GEP = OMPBuilder.Builder.CreateInBoundsGEP(
+            BasePtrsAlloca->getType()->getPointerElementType(), BasePtrsAlloca,
+            {OMPBuilder.Builder.getInt32(0), OMPBuilder.Builder.getInt32(Idx)});
+        auto *Bitcast = OMPBuilder.Builder.CreateBitCast(
+            GEP, MI.BasePtr->getType()->getPointerTo());
+        OMPBuilder.Builder.CreateStore(MI.BasePtr, Bitcast);
+
+        // Store in the pointers alloca.
+        GEP = OMPBuilder.Builder.CreateInBoundsGEP(
+            PtrsAlloca->getType()->getPointerElementType(), PtrsAlloca,
+            {OMPBuilder.Builder.getInt32(0), OMPBuilder.Builder.getInt32(Idx)});
+        Bitcast = OMPBuilder.Builder.CreateBitCast(
+            GEP, MI.Ptr->getType()->getPointerTo());
+        OMPBuilder.Builder.CreateStore(MI.Ptr, Bitcast);
+
+        // Store in the sizes alloca.
+        GEP = OMPBuilder.Builder.CreateInBoundsGEP(
+            SizesAlloca->getType()->getPointerElementType(), SizesAlloca,
+            {OMPBuilder.Builder.getInt32(0), OMPBuilder.Builder.getInt32(Idx)});
+        Bitcast = OMPBuilder.Builder.CreateBitCast(
+            GEP, MI.Size->getType()->getPointerTo());
+        OMPBuilder.Builder.CreateStore(MI.Size, Bitcast);
+
+        Idx++;
+      }
+
+      OffloadingMappingArgs.Size = MapperInfos.size();
+      OffloadingMappingArgs.BasePtrs = OMPBuilder.Builder.CreateBitCast(
+          BasePtrsAlloca, OMPBuilder.VoidPtrPtr);
+      OffloadingMappingArgs.Ptrs =
+          OMPBuilder.Builder.CreateBitCast(PtrsAlloca, OMPBuilder.VoidPtrPtr);
+      OffloadingMappingArgs.Sizes = OMPBuilder.Builder.CreateBitCast(
+          SizesAlloca, OMPBuilder.SizeTy->getPointerTo());
+
+      //OffloadingMappingArgs.BasePtrs = OMPBuilder.Builder.CreateInBoundsGEP(
+      //    BasePtrsAlloca->getType()->getPointerElementType(), BasePtrsAlloca,
+      //    {OMPBuilder.Builder.getInt32(0), OMPBuilder.Builder.getInt32(0)});
+      //OffloadingMappingArgs.Ptrs = OMPBuilder.Builder.CreateInBoundsGEP(
+      //    PtrsAlloca->getType()->getPointerElementType(), PtrsAlloca,
+      //    {OMPBuilder.Builder.getInt32(0), OMPBuilder.Builder.getInt32(0)});
+      //OffloadingMappingArgs.Sizes = OMPBuilder.Builder.CreateInBoundsGEP(
+      //    SizesAlloca->getType()->getPointerElementType(), SizesAlloca,
+      //    {OMPBuilder.Builder.getInt32(0), OMPBuilder.Builder.getInt32(0)});
     }
 
     bool runOnModule(Module &M) override {
@@ -921,6 +1077,7 @@ namespace {
           Value *IfCondition = nullptr;
         } ParRegionInfo;
 
+        MapVector<Value *, SmallVector<FieldMappingInfo, 4>> StructMappingInfoMap;
         // TODO: Fix scoping under an info struct.
         GlobalVariable *OMPRegionId;
 
@@ -939,237 +1096,249 @@ namespace {
             assert(It != StringToDir.end() && "Directive is not supported!");
             Dir = It->second;
           } else if (Tag.startswith("QUAL")) {
-            for (auto I = O.input_begin(), E = O.input_end(); I != E; ++I) {
-              Value *V = dyn_cast<Value>(*I);
-              assert(V && "Expected Value");
+            const ArrayRef<Value *> &TagInputs = O.inputs();
+            if (Tag.startswith("QUAL.OMP.NORMALIZED.IV")) {
+              assert(O.input_size() == 1 && "Expected single IV value");
+              OMPLoopInfo.IV = TagInputs[0];
+            } else if (Tag.startswith("QUAL.OMP.NORMALIZED.UB")) {
+              assert(O.input_size() == 1 && "Expected single UB value");
+              OMPLoopInfo.UB = TagInputs[0];
+            } else if (Tag.startswith("QUAL.OMP.NUM_THREADS")) {
+              assert(O.input_size() == 1 && "Expected single NumThreads value");
+              ParRegionInfo.NumThreads = TagInputs[0];
+            } else if (Tag.startswith("QUAL.OMP.SCHEDULE")) {
+              assert(O.input_size() == 1 &&
+                     "Expected single chunking scheduling value");
+              Constant *Zero = ConstantInt::get(TagInputs[0]->getType(), 0);
+              OMPLoopInfo.Chunk = TagInputs[0];
 
-              if (Tag.startswith("QUAL.OMP.NORMALIZED.IV")) {
-                assert(O.input_size() == 1 && "Expected single IV value");
-                OMPLoopInfo.IV = V;
-              } else if (Tag.startswith("QUAL.OMP.NORMALIZED.UB")) {
-                assert(O.input_size() == 1 && "Expected single UB value");
-                OMPLoopInfo.UB = V;
-              } else if (Tag.startswith("QUAL.OMP.NUM_THREADS")) {
-                assert(O.input_size() == 1 &&
-                       "Expected single NumThreads value");
-                ParRegionInfo.NumThreads = V;
-              } else if (Tag.startswith("QUAL.OMP.SCHEDULE")) {
-                assert(O.input_size() == 1 &&
-                       "Expected single chunking scheduling value");
-                Constant *Zero = ConstantInt::get(V->getType(), 0);
-                OMPLoopInfo.Chunk = V;
+              if (Tag == "QUAL.OMP.SCHEDULE.STATIC") {
+                assert(TagInputs[0] == Zero &&
+                       "Chunking is not yet supported, requires "
+                       "the use of omp_stride (static_chunked)");
+                if (TagInputs[0] == Zero)
+                  OMPLoopInfo.Sched = OMPScheduleType::Static;
+                else
+                  OMPLoopInfo.Sched = OMPScheduleType::StaticChunked;
+              } else
+                assert(false && "Unsupported scheduling type");
+            } else if (Tag.startswith("QUAL.OMP.IF")) {
+              assert(O.input_size() == 1 &&
+                     "Expected single if condition value");
+              ParRegionInfo.IfCondition = TagInputs[0];
+            } else if (Tag.startswith("QUAL.OMP.REDUCTION.ADD")) {
+              DSAValueMap[TagInputs[0]] = DSA_REDUCTION_ADD;
+            } else if (Tag.startswith("QUAL.OMP.TARGET.DEV_FUNC")) {
+              assert(O.input_size() == 1 &&
+                     "Expected a single device function name");
+              ConstantDataArray *DevFuncArray =
+                  dyn_cast<ConstantDataArray>(TagInputs[0]);
+              assert(DevFuncArray &&
+                     "Expected constant string for the device function");
+              Twine DevFuncName =
+                  ".omp_offload_numba." + DevFuncArray->getAsString();
 
-                if (Tag == "QUAL.OMP.SCHEDULE.STATIC") {
-                  assert(V == Zero && "Chunking is not yet supported, requires "
-                                      "the use of omp_stride (static_chunked)");
-                  if (V == Zero)
-                    OMPLoopInfo.Sched = OMPScheduleType::Static;
-                  else
-                    OMPLoopInfo.Sched = OMPScheduleType::StaticChunked;
-                } else
-                  assert(false && "Unsupported scheduling type");
-              } else if (Tag.startswith("QUAL.OMP.IF")) {
-                assert(O.input_size() == 1 &&
-                       "Expected single if condition value");
-                ParRegionInfo.IfCondition = V;
-              } else if (Tag.startswith("QUAL.OMP.REDUCTION.ADD")) {
-                DSAValueMap[V] = DSA_REDUCTION_ADD;
+              // TODO: assumes 1 target region, can we call tgt_register_lib
+              // multiple times?
+              OMPRegionId = new GlobalVariable(
+                  M, OMPBuilder.Int8, /* isConstant */ true,
+                  GlobalValue::WeakAnyLinkage,
+                  ConstantInt::get(OMPBuilder.Int8, 0),
+                  DevFuncName + ".region_id", nullptr,
+                  GlobalVariable::NotThreadLocal, /* AddressSpace */ 0);
+
+              Constant *OMPOffloadEntry;
+              emitOMPOffloadingEntry(M, OMPBuilder, TgtOffloadEntryTy,
+                                     DevFuncName, OMPRegionId, OMPOffloadEntry);
+
+              // TODO: do this at finalization when all entries have been
+              // found.
+              // TODO: assumes 1 device image, can we call tgt_register_lib
+              // multiple times?
+              auto *ArrayTy = ArrayType::get(TgtOffloadEntryTy, 1);
+              OMPOffloadEntries = new GlobalVariable(
+                  M, ArrayTy,
+                  /* isConstant */ true, GlobalValue::ExternalLinkage,
+                  ConstantArray::get(ArrayTy, {OMPOffloadEntry}),
+                  ".omp_offloading.entries");
+
+            } else if (Tag.startswith("QUAL.OMP.TARGET.ELF")) {
+              assert(O.input_size() == 1 &&
+                     "Expected a single elf image string");
+              ConstantDataArray *ELFConstant =
+                  dyn_cast<ConstantDataArray>(TagInputs[0]);
+              assert(ELFConstant && "Expected constant string for ELF");
+              auto *GV = new GlobalVariable(
+                  M, ELFConstant->getType(), /* isConstant */ true,
+                  GlobalValue::InternalLinkage, ELFConstant,
+                  ".omp_offloading.device_image");
+              GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
+              StructType *TgtDeviceImageTy =
+                  StructType::create({OMPBuilder.Int8Ptr, OMPBuilder.Int8Ptr,
+                                      TgtOffloadEntryTy->getPointerTo(),
+                                      TgtOffloadEntryTy->getPointerTo()},
+                                     "struct.__tgt_device_image");
+
+              StructType *TgtBinDescTy = StructType::create(
+                  {OMPBuilder.Int32, TgtDeviceImageTy->getPointerTo(),
+                   TgtOffloadEntryTy->getPointerTo(),
+                   TgtOffloadEntryTy->getPointerTo()},
+                  "struct.__tgt_bin_desc");
+
+              auto *ArrayTy = ArrayType::get(TgtDeviceImageTy, 1);
+              auto *Zero = ConstantInt::get(OMPBuilder.SizeTy, 0);
+              auto *One = ConstantInt::get(OMPBuilder.SizeTy, 1);
+              auto *Size = ConstantInt::get(OMPBuilder.SizeTy,
+                                            ELFConstant->getNumElements());
+              Constant *ZeroZero[] = {Zero, Zero};
+              Constant *ZeroOne[] = {Zero, One};
+              Constant *ZeroSize[] = {Zero, Size};
+
+              auto *ImageB = ConstantExpr::getGetElementPtr(GV->getValueType(),
+                                                            GV, ZeroZero);
+              auto *ImageE = ConstantExpr::getGetElementPtr(GV->getValueType(),
+                                                            GV, ZeroSize);
+              auto *EntriesB = ConstantExpr::getGetElementPtr(
+                  OMPOffloadEntries->getValueType(), OMPOffloadEntries,
+                  ZeroZero);
+              auto *EntriesE = ConstantExpr::getGetElementPtr(
+                  OMPOffloadEntries->getValueType(), OMPOffloadEntries,
+                  ZeroOne);
+
+              auto *DeviceImageEntry = ConstantStruct::get(
+                  TgtDeviceImageTy, ImageB, ImageE, EntriesB, EntriesE);
+              auto *DeviceImages = new GlobalVariable(
+                  M, ArrayTy,
+                  /* isConstant */ true, GlobalValue::InternalLinkage,
+                  ConstantArray::get(ArrayTy, {DeviceImageEntry}),
+                  ".omp_offloading.device_images");
+
+              auto *ImagesB = ConstantExpr::getGetElementPtr(
+                  DeviceImages->getValueType(), DeviceImages, ZeroZero);
+              auto *DescInit = ConstantStruct::get(
+                  TgtBinDescTy,
+                  ConstantInt::get(OMPBuilder.Int32,
+                                   /* number of images */ 1),
+                  ImagesB, EntriesB, EntriesE);
+              auto *BinDesc = new GlobalVariable(
+                  M, DescInit->getType(),
+                  /* isConstant */ true, GlobalValue::InternalLinkage, DescInit,
+                  ".omp_offloading.descriptor");
+
+              // Add tgt_register_requires, tgt_register_lib,
+              // tgt_unregister_lib.
+              {
+                // tgt_register_requires.
+                auto *FuncTy =
+                    FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
+                auto *Func =
+                    Function::Create(FuncTy, GlobalValue::InternalLinkage,
+                                     ".omp_offloading.requires_reg", &M);
+                Func->setSection(".text.startup");
+
+                // Get __tgt_register_lib function declaration.
+                auto *RegFuncTy =
+                    FunctionType::get(OMPBuilder.Void, OMPBuilder.Int64,
+                                      /*isVarArg*/ false);
+                FunctionCallee RegFuncC =
+                    M.getOrInsertFunction("__tgt_register_requires", RegFuncTy);
+
+                // Construct function body
+                IRBuilder<> Builder(
+                    BasicBlock::Create(M.getContext(), "entry", Func));
+                // TODO: fix to pass the requirements enum value.
+                Builder.CreateCall(RegFuncC,
+                                   ConstantInt::get(OMPBuilder.Int64, 1));
+                Builder.CreateRetVoid();
+
+                // Add this function to constructors.
+                // Set priority to 1 so that __tgt_register_lib is executed
+                // AFTER
+                // __tgt_register_requires (we want to know what requirements
+                // have been asked for before we load a libomptarget plugin so
+                // that by the time the plugin is loaded it can report how
+                // many devices there are which can satisfy these
+                // requirements).
+                appendToGlobalCtors(M, Func, /*Priority*/ 0);
               }
-              else if (Tag.startswith("QUAL.OMP.TARGET.DEV_FUNC")) {
-                assert(O.input_size() == 1 &&
-                       "Expected a single device function name");
-                ConstantDataArray *DevFuncArray = dyn_cast<ConstantDataArray>(V);
-                assert(DevFuncArray && "Expected constant string for the device function");
-                Twine DevFuncName =
-                    ".omp_offload_numba." + DevFuncArray->getAsString();
+              {
+                // ctor
+                auto *FuncTy =
+                    FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
+                auto *Func =
+                    Function::Create(FuncTy, GlobalValue::InternalLinkage,
+                                     ".omp_offloading.descriptor_reg", &M);
+                Func->setSection(".text.startup");
 
-                // TODO: assumes 1 target region, can we call tgt_register_lib multiple
-                // times?
-                OMPRegionId = new GlobalVariable(
-                    M, OMPBuilder.Int8, /* isConstant */ true,
-                    GlobalValue::WeakAnyLinkage,
-                    ConstantInt::get(OMPBuilder.Int8, 0),
-                    DevFuncName + ".region_id", nullptr,
-                    GlobalVariable::NotThreadLocal, /* AddressSpace */ 0);
+                // Get __tgt_register_lib function declaration.
+                auto *RegFuncTy = FunctionType::get(
+                    OMPBuilder.Void, TgtBinDescTy->getPointerTo(),
+                    /*isVarArg*/ false);
+                FunctionCallee RegFuncC =
+                    M.getOrInsertFunction("__tgt_register_lib", RegFuncTy);
 
-                Constant *OMPOffloadEntry;
-                emitOMPOffloadingEntry(M, OMPBuilder, TgtOffloadEntryTy,
-                                       DevFuncName, OMPRegionId,
-                                       OMPOffloadEntry);
+                // Construct function body
+                IRBuilder<> Builder(
+                    BasicBlock::Create(M.getContext(), "entry", Func));
+                Builder.CreateCall(RegFuncC, BinDesc);
+                Builder.CreateRetVoid();
 
-                // TODO: do this at finalization when all entries have been
-                // found.
-                // TODO: assumes 1 device image, can we call tgt_register_lib
-                // multiple times?
-                auto *ArrayTy = ArrayType::get(TgtOffloadEntryTy, 1);
-                OMPOffloadEntries = new GlobalVariable(
-                    M, ArrayTy,
-                    /* isConstant */ true, GlobalValue::ExternalLinkage,
-                    ConstantArray::get(ArrayTy, {OMPOffloadEntry}),
-                    ".omp_offloading.entries");
-
-              } else if (Tag.startswith("QUAL.OMP.TARGET.ELF")) {
-                assert(O.input_size() == 1 &&
-                       "Expected a single elf image string");
-                ConstantDataArray *ELFConstant = dyn_cast<ConstantDataArray>(V);
-                assert(ELFConstant && "Expected constant string for ELF");
-                auto *GV = new GlobalVariable(
-                    M, ELFConstant->getType(), /* isConstant */ true,
-                    GlobalValue::InternalLinkage, ELFConstant,
-                    ".omp_offloading.device_image");
-                GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-
-                StructType *TgtDeviceImageTy =
-                    StructType::create({OMPBuilder.Int8Ptr, OMPBuilder.Int8Ptr,
-                                        TgtOffloadEntryTy->getPointerTo(),
-                                        TgtOffloadEntryTy->getPointerTo()},
-                                       "struct.__tgt_device_image");
-
-                StructType *TgtBinDescTy = StructType::create(
-                    {OMPBuilder.Int32, TgtDeviceImageTy->getPointerTo(),
-                     TgtOffloadEntryTy->getPointerTo(),
-                     TgtOffloadEntryTy->getPointerTo()},
-                    "struct.__tgt_bin_desc");
-
-                auto *ArrayTy = ArrayType::get(TgtDeviceImageTy, 1);
-                auto *Zero = ConstantInt::get(OMPBuilder.SizeTy, 0);
-                auto *One = ConstantInt::get(OMPBuilder.SizeTy, 1);
-                auto *Size = ConstantInt::get(OMPBuilder.SizeTy, ELFConstant->getNumElements());
-                Constant *ZeroZero[] = {Zero, Zero};
-                Constant *ZeroOne[] = {Zero, One};
-                Constant *ZeroSize[] = {Zero, Size};
-
-                auto *ImageB = ConstantExpr::getGetElementPtr(
-                    GV->getValueType(), GV, ZeroZero);
-                auto *ImageE = ConstantExpr::getGetElementPtr(
-                                            GV->getValueType(), GV, ZeroSize);
-                auto *EntriesB = ConstantExpr::getGetElementPtr(
-                                            OMPOffloadEntries->getValueType(),
-                                            OMPOffloadEntries, ZeroZero);
-                auto *EntriesE = ConstantExpr::getGetElementPtr(
-                                            OMPOffloadEntries->getValueType(),
-                                            OMPOffloadEntries, ZeroOne);
-
-                auto *DeviceImageEntry = ConstantStruct::get(
-                    TgtDeviceImageTy, ImageB, ImageE, EntriesB, EntriesE);
-                auto *DeviceImages = new GlobalVariable(
-                    M, ArrayTy,
-                    /* isConstant */ true, GlobalValue::InternalLinkage,
-                    ConstantArray::get(ArrayTy, {DeviceImageEntry}),
-                    ".omp_offloading.device_images");
-
-                auto *ImagesB = ConstantExpr::getGetElementPtr(
-                    DeviceImages->getValueType(), DeviceImages, ZeroZero);
-                auto *DescInit = ConstantStruct::get(
-                    TgtBinDescTy,
-                    ConstantInt::get(OMPBuilder.Int32,
-                                     /* number of images */ 1),
-                    ImagesB, EntriesB, EntriesE);
-                auto *BinDesc = new GlobalVariable(M, DescInit->getType(),
-                                   /* isConstant */ true,
-                                   GlobalValue::InternalLinkage, DescInit,
-                                   ".omp_offloading.descriptor");
-
-                // Add tgt_register_requires, tgt_register_lib, tgt_unregister_lib.
-                {
-                  // tgt_register_requires.
-                  auto *FuncTy =
-                      FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
-                  auto *Func =
-                      Function::Create(FuncTy, GlobalValue::InternalLinkage,
-                                       ".omp_offloading.requires_reg", &M);
-                  Func->setSection(".text.startup");
-
-                  // Get __tgt_register_lib function declaration.
-                  auto *RegFuncTy =
-                      FunctionType::get(OMPBuilder.Void, OMPBuilder.Int64,
-                                        /*isVarArg*/ false);
-                  FunctionCallee RegFuncC =
-                      M.getOrInsertFunction("__tgt_register_requires", RegFuncTy);
-
-                  // Construct function body
-                  IRBuilder<> Builder(
-                      BasicBlock::Create(M.getContext(), "entry", Func));
-                  // TODO: fix to pass the requirements enum value.
-                  Builder.CreateCall(RegFuncC,
-                                     ConstantInt::get(OMPBuilder.Int64, 1));
-                  Builder.CreateRetVoid();
-
-                  // Add this function to constructors.
-                  // Set priority to 1 so that __tgt_register_lib is executed
-                  // AFTER
-                  // __tgt_register_requires (we want to know what requirements
-                  // have been asked for before we load a libomptarget plugin so
-                  // that by the time the plugin is loaded it can report how
-                  // many devices there are which can satisfy these
-                  // requirements).
-                  appendToGlobalCtors(M, Func, /*Priority*/ 0);
-                }
-                {
-                  // ctor
-                  auto *FuncTy =
-                      FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
-                  auto *Func =
-                      Function::Create(FuncTy, GlobalValue::InternalLinkage,
-                                       ".omp_offloading.descriptor_reg", &M);
-                  Func->setSection(".text.startup");
-
-                  // Get __tgt_register_lib function declaration.
-                  auto *RegFuncTy = FunctionType::get(
-                      OMPBuilder.Void, TgtBinDescTy->getPointerTo(),
-                      /*isVarArg*/ false);
-                  FunctionCallee RegFuncC =
-                      M.getOrInsertFunction("__tgt_register_lib", RegFuncTy);
-
-                  // Construct function body
-                  IRBuilder<> Builder(
-                      BasicBlock::Create(M.getContext(), "entry", Func));
-                  Builder.CreateCall(RegFuncC, BinDesc);
-                  Builder.CreateRetVoid();
-
-                  // Add this function to constructors.
-                  // Set priority to 1 so that __tgt_register_lib is executed
-                  // AFTER
-                  // __tgt_register_requires (we want to know what requirements
-                  // have been asked for before we load a libomptarget plugin so
-                  // that by the time the plugin is loaded it can report how
-                  // many devices there are which can satisfy these
-                  // requirements).
-                  appendToGlobalCtors(M, Func, /*Priority*/ 1);
-                }
-                {
-                  auto *FuncTy =
-                      FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
-                  auto *Func =
-                      Function::Create(FuncTy, GlobalValue::InternalLinkage,
-                                       ".omp_offloading.descriptor_unreg", &M);
-                  Func->setSection(".text.startup");
-
-                  // Get __tgt_unregister_lib function declaration.
-                  auto *UnRegFuncTy = FunctionType::get(
-                      OMPBuilder.Void, TgtBinDescTy->getPointerTo(),
-                      /*isVarArg*/ false);
-                  FunctionCallee UnRegFuncC = M.getOrInsertFunction(
-                      "__tgt_unregister_lib", UnRegFuncTy);
-
-                  // Construct function body
-                  IRBuilder<> Builder(
-                      BasicBlock::Create(M.getContext(), "entry", Func));
-                  Builder.CreateCall(UnRegFuncC, BinDesc);
-                  Builder.CreateRetVoid();
-
-                  // Add this function to global destructors.
-                  // Match priority of __tgt_register_lib
-                  appendToGlobalDtors(M, Func, /*Priority*/ 1);
-                }
-              } else /* DSA Qualifiers */ {
-                auto It = StringToDSA.find(Tag);
-                assert(It != StringToDSA.end() && "DSA type not found in map");
-                DSAValueMap[V] = It->second;
+                // Add this function to constructors.
+                // Set priority to 1 so that __tgt_register_lib is executed
+                // AFTER
+                // __tgt_register_requires (we want to know what requirements
+                // have been asked for before we load a libomptarget plugin so
+                // that by the time the plugin is loaded it can report how
+                // many devices there are which can satisfy these
+                // requirements).
+                appendToGlobalCtors(M, Func, /*Priority*/ 1);
               }
+              {
+                auto *FuncTy =
+                    FunctionType::get(OMPBuilder.Void, /*isVarArg*/ false);
+                auto *Func =
+                    Function::Create(FuncTy, GlobalValue::InternalLinkage,
+                                     ".omp_offloading.descriptor_unreg", &M);
+                Func->setSection(".text.startup");
+
+                // Get __tgt_unregister_lib function declaration.
+                auto *UnRegFuncTy = FunctionType::get(
+                    OMPBuilder.Void, TgtBinDescTy->getPointerTo(),
+                    /*isVarArg*/ false);
+                FunctionCallee UnRegFuncC =
+                    M.getOrInsertFunction("__tgt_unregister_lib", UnRegFuncTy);
+
+                // Construct function body
+                IRBuilder<> Builder(
+                    BasicBlock::Create(M.getContext(), "entry", Func));
+                Builder.CreateCall(UnRegFuncC, BinDesc);
+                Builder.CreateRetVoid();
+
+                // Add this function to global destructors.
+                // Match priority of __tgt_register_lib
+                appendToGlobalDtors(M, Func, /*Priority*/ 1);
+              }
+            } else /* DSA Qualifiers */ {
+              auto It = StringToDSA.find(Tag);
+              assert(It != StringToDSA.end() && "DSA type not found in map");
+              if (It->second == DSA_MAP_TO_STRUCT ||
+                  It->second == DSA_MAP_FROM_STRUCT ||
+                  It->second == DSA_MAP_TOFROM_STRUCT) {
+                assert((TagInputs.size() - 1) % 3 == 0 &&
+                       "Expected input triplets for struct mapping");
+                for (size_t I = 1; I < TagInputs.size(); I += 3) {
+                  Value *Index = TagInputs[I];
+                  Value *Offset = TagInputs[I + 1];
+                  Value *NumElements = TagInputs[I + 2];
+                  StructMappingInfoMap[TagInputs[0]].push_back(
+                      {Index, Offset, NumElements});
+                }
+              }
+
+              DSAValueMap[TagInputs[0]] = It->second;
             }
-          }
-          else {
+          } else {
             // TODO: remove special handler for OMP.DEVICE, make it a qualifier,
             // error-check that OPBs are recognized.
             IsOpenMPDevice = true;
@@ -1319,32 +1488,37 @@ namespace {
           // and generalize. We only need to generate offloading entries.
           if (IsOpenMPDevice) {
             // Emit the Numba wrapper offloading function.
-            SmallVector<Type *, 8> WrapperArgs;
+            SmallVector<Type *, 8> WrapperArgsTypes;
+            SmallVector<StringRef, 8> WrapperArgsNames;
             for (auto &It : DSAValueMap) {
               Value *V = It.first;
               DSAType DSA = It.second;
 
               switch (DSA) {
               case DSA_FIRSTPRIVATE:
-                WrapperArgs.push_back(V->getType()->getPointerElementType());
+                WrapperArgsTypes.push_back(
+                    V->getType()->getPointerElementType());
+                WrapperArgsNames.push_back(V->getName());
+                break;
+              case DSA_PRIVATE:
+                // do nothing
                 break;
               default:
-                WrapperArgs.push_back(V->getType());
+                WrapperArgsTypes.push_back(V->getType());
+                WrapperArgsNames.push_back(V->getName());
               }
             }
 
             Twine DevFuncName = ".omp_offload_numba." + Fn->getName();
-            FunctionType *NumbaWrapperFnTy = FunctionType::get(OMPBuilder.Void, WrapperArgs,
-                                                   /* isVarArg */ false);
+            FunctionType *NumbaWrapperFnTy =
+                FunctionType::get(OMPBuilder.Void, WrapperArgsTypes,
+                                  /* isVarArg */ false);
             Function *NumbaWrapperFunc = Function::Create(
-                NumbaWrapperFnTy, GlobalValue::ExternalLinkage,
-                DevFuncName, M);
-            int ArgIdx = 0;
-            for (auto &It : DSAValueMap) {
-              Value *V = It.first;
-              NumbaWrapperFunc->getArg(ArgIdx)->setName(V->getName());
-              ArgIdx++;
-            }
+                NumbaWrapperFnTy, GlobalValue::ExternalLinkage, DevFuncName, M);
+
+            // Name the wrapper arguments for readability.
+            for (size_t I = 0; I < NumbaWrapperFunc->arg_size(); ++I)
+              NumbaWrapperFunc->getArg(I)->setName(WrapperArgsNames[I]);
 
             IRBuilder<> Builder(
                 BasicBlock::Create(M.getContext(), "entry", NumbaWrapperFunc));
@@ -1384,17 +1558,16 @@ namespace {
           InsertPointTy AllocaIP(&Fn->getEntryBlock(),
                                  Fn->getEntryBlock().getFirstInsertionPt());
           emitOMPOffloadingMappings(M, OMPBuilder, AllocaIP, DSAValueMap,
+                                    StructMappingInfoMap,
                                     OffloadingMappingArgs);
 
           auto *OffloadResult = OMPBuilder.Builder.CreateCall(
               TargetMapper,
               {SrcLoc, ConstantInt::get(OMPBuilder.Int64, -1),
                ConstantExpr::getBitCast(OMPRegionId, OMPBuilder.Int8Ptr),
-               ConstantInt::get(OMPBuilder.Int32, DSAValueMap.size()),
-               OffloadingMappingArgs.BasePtrs,
-               OffloadingMappingArgs.Ptrs,
-               OffloadingMappingArgs.Sizes,
-               OffloadingMappingArgs.MapTypes,
+               ConstantInt::get(OMPBuilder.Int32, OffloadingMappingArgs.Size),
+               OffloadingMappingArgs.BasePtrs, OffloadingMappingArgs.Ptrs,
+               OffloadingMappingArgs.Sizes, OffloadingMappingArgs.MapTypes,
                OffloadingMappingArgs.MapNames,
                // TODO: offload_mappers is null for now.
                Constant::getNullValue(OMPBuilder.VoidPtrPtr)});
