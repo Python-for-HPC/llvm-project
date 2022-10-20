@@ -47,7 +47,8 @@ namespace {
     DSA_MAP_TOFROM,
     DSA_MAP_TO_STRUCT,
     DSA_MAP_FROM_STRUCT,
-    DSA_MAP_TOFROM_STRUCT
+    DSA_MAP_TOFROM_STRUCT,
+    DSA_MAP_STRUCT
   };
 
   static const DenseMap<StringRef, Directive> StringToDir = {
@@ -156,6 +157,7 @@ namespace {
     Value *Index;
     Value *Offset;
     Value *NumElements;
+    DSAType MapType;
   };
 
   using InsertPointTy = OpenMPIRBuilder::InsertPointTy;
@@ -806,6 +808,9 @@ namespace {
         // TODO: maybe add debug info.
         OffloadMapNames.push_back(
             OMPBuilder.getOrCreateSrcLocStr(BasePtr->getName(), "", 0, 0));
+        LLVM_DEBUG(dbgs() << "Emit mapping entry BasePtr " << *BasePtr
+                          << " Ptr " << *Ptr << " Size " << *Size << " MapType "
+                          << MapType << "\n");
         MapperInfos.push_back({BasePtr, Ptr, Size});
       };
 
@@ -830,15 +835,7 @@ namespace {
           MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_TO |
                      OMP_TGT_MAPTYPE_FROM;
           break;
-        case DSA_MAP_TO_STRUCT:
-          MapType = OMP_TGT_MAPTYPE_TO;
-          break;
-        case DSA_MAP_FROM_STRUCT:
-          MapType = OMP_TGT_MAPTYPE_FROM;
-          break;
-        case DSA_MAP_TOFROM_STRUCT:
-          MapType = OMP_TGT_MAPTYPE_TO | OMP_TGT_MAPTYPE_FROM;
-          break;
+        case DSA_MAP_STRUCT:
         case DSA_PRIVATE:
           // do nothing
           break;
@@ -859,9 +856,7 @@ namespace {
               M.getDataLayout().getTypeAllocSize(V->getType()));
           EmitMappingEntry(Size, MapType, V, V);
           break;
-        case DSA_MAP_TO_STRUCT:
-        case DSA_MAP_FROM_STRUCT:
-        case DSA_MAP_TOFROM_STRUCT: {
+        case DSA_MAP_STRUCT: {
           Size = ConstantInt::get(
               OMPBuilder.SizeTy, M.getDataLayout().getTypeAllocSize(
                                      V->getType()->getPointerElementType()));
@@ -871,6 +866,20 @@ namespace {
           size_t ArgPos = MapperInfos.size();
 
           for (auto &FieldInfo : StructMappingInfoMap[V]) {
+            switch (FieldInfo.MapType) {
+              case DSA_MAP_TO_STRUCT:
+                MapType = OMP_TGT_MAPTYPE_TO;
+                break;
+              case DSA_MAP_FROM_STRUCT:
+                MapType = OMP_TGT_MAPTYPE_FROM;
+                break;
+              case DSA_MAP_TOFROM_STRUCT:
+                MapType = OMP_TGT_MAPTYPE_TO | OMP_TGT_MAPTYPE_FROM;
+                break;
+              default:
+                assert(false && "Unknown struct mapping type");
+                report_fatal_error("Unknown struct mapping type");
+            }
             // MEMBER_OF(Argument Position)
             const size_t MemberOfOffset = 48;
             uint64_t MemberOfBits = ArgPos << MemberOfOffset;
@@ -1325,18 +1334,18 @@ namespace {
               if (It->second == DSA_MAP_TO_STRUCT ||
                   It->second == DSA_MAP_FROM_STRUCT ||
                   It->second == DSA_MAP_TOFROM_STRUCT) {
-                assert((TagInputs.size() - 1) % 3 == 0 &&
-                       "Expected input triplets for struct mapping");
-                for (size_t I = 1; I < TagInputs.size(); I += 3) {
-                  Value *Index = TagInputs[I];
-                  Value *Offset = TagInputs[I + 1];
-                  Value *NumElements = TagInputs[I + 2];
-                  StructMappingInfoMap[TagInputs[0]].push_back(
-                      {Index, Offset, NumElements});
-                }
-              }
+                assert((TagInputs.size() - 1) == 3 &&
+                       "Expected input triple for struct mapping");
+                Value *Index = TagInputs[1];
+                Value *Offset = TagInputs[2];
+                Value *NumElements = TagInputs[3];
+                StructMappingInfoMap[TagInputs[0]].push_back(
+                    {Index, Offset, NumElements, It->second});
 
-              DSAValueMap[TagInputs[0]] = It->second;
+                DSAValueMap[TagInputs[0]] = DSA_MAP_STRUCT;
+              }
+              else
+                DSAValueMap[TagInputs[0]] = It->second;
             }
           } else {
             // TODO: remove special handler for OMP.DEVICE, make it a qualifier,
@@ -1509,7 +1518,7 @@ namespace {
               }
             }
 
-            Twine DevFuncName = ".omp_offload_numba." + Fn->getName();
+            Twine DevFuncName = ".omp_offload.numba." + Fn->getName();
             FunctionType *NumbaWrapperFnTy =
                 FunctionType::get(OMPBuilder.Void, WrapperArgsTypes,
                                   /* isVarArg */ false);
