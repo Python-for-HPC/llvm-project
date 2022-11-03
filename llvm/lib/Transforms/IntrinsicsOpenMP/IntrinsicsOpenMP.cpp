@@ -814,12 +814,8 @@ namespace {
         MapperInfos.push_back({BasePtr, Ptr, Size});
       };
 
-      // Keep track of argument position, needed for struct mappings.
-      for (auto &It : DSAValueMap) {
-        Value *V = It.first;
-        DSAType DSA = It.second;
-        uint64_t MapType = 0;
-
+      auto GetMapType = [](DSAType DSA) {
+        uint64_t MapType;
         // Determine the map type, completely or partly (structs).
         switch (DSA) {
         case DSA_FIRSTPRIVATE:
@@ -833,9 +829,20 @@ namespace {
           break;
         case DSA_MAP_TOFROM:
           MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_TO |
-                     OMP_TGT_MAPTYPE_FROM;
+                    OMP_TGT_MAPTYPE_FROM;
           break;
         case DSA_MAP_STRUCT:
+          MapType = OMP_TGT_MAPTYPE_TARGET_PARAM;
+          break;
+        case DSA_MAP_TO_STRUCT:
+          MapType = OMP_TGT_MAPTYPE_TO;
+          break;
+        case DSA_MAP_FROM_STRUCT:
+          MapType = OMP_TGT_MAPTYPE_FROM;
+          break;
+        case DSA_MAP_TOFROM_STRUCT:
+          MapType = OMP_TGT_MAPTYPE_TO | OMP_TGT_MAPTYPE_FROM;
+          break;
         case DSA_PRIVATE:
           // do nothing
           break;
@@ -843,6 +850,14 @@ namespace {
           assert(false && "Unknown mapping type");
           report_fatal_error("Unknown mapping type");
         }
+
+        return MapType;
+      };
+
+      // Keep track of argument position, needed for struct mappings.
+      for (auto &It : DSAValueMap) {
+        Value *V = It.first;
+        DSAType DSA = It.second;
 
         // Emit the mapping entry.
         Value *Size;
@@ -854,36 +869,22 @@ namespace {
           Size = ConstantInt::get(
               OMPBuilder.SizeTy,
               M.getDataLayout().getTypeAllocSize(V->getType()));
-          EmitMappingEntry(Size, MapType, V, V);
+          EmitMappingEntry(Size, GetMapType(DSA), V, V);
           break;
         case DSA_MAP_STRUCT: {
           Size = ConstantInt::get(
               OMPBuilder.SizeTy, M.getDataLayout().getTypeAllocSize(
                                      V->getType()->getPointerElementType()));
-          EmitMappingEntry(Size, OMP_TGT_MAPTYPE_TARGET_PARAM, V, V);
+          EmitMappingEntry(Size, GetMapType(DSA), V, V);
           // Stores the argument position (starting from 1) of the parent
           // struct, to be used to set MEMBER_OF in the map type.
           size_t ArgPos = MapperInfos.size();
 
           for (auto &FieldInfo : StructMappingInfoMap[V]) {
-            switch (FieldInfo.MapType) {
-              case DSA_MAP_TO_STRUCT:
-                MapType = OMP_TGT_MAPTYPE_TO;
-                break;
-              case DSA_MAP_FROM_STRUCT:
-                MapType = OMP_TGT_MAPTYPE_FROM;
-                break;
-              case DSA_MAP_TOFROM_STRUCT:
-                MapType = OMP_TGT_MAPTYPE_TO | OMP_TGT_MAPTYPE_FROM;
-                break;
-              default:
-                assert(false && "Unknown struct mapping type");
-                report_fatal_error("Unknown struct mapping type");
-            }
             // MEMBER_OF(Argument Position)
             const size_t MemberOfOffset = 48;
             uint64_t MemberOfBits = ArgPos << MemberOfOffset;
-            uint64_t FieldMapType = MapType | MemberOfBits;
+            uint64_t FieldMapType = GetMapType(FieldInfo.MapType) | MemberOfBits;
             auto *FieldGEP = OMPBuilder.Builder.CreateInBoundsGEP(
                 V->getType()->getPointerElementType(), V,
                 {OMPBuilder.Builder.getInt32(0), FieldInfo.Index});
