@@ -1145,7 +1145,7 @@ namespace {
               assert(DevFuncArray &&
                      "Expected constant string for the device function");
               Twine DevFuncName =
-                  ".omp_offload_numba." + DevFuncArray->getAsString();
+                  "__omp_offload_numba_" + DevFuncArray->getAsString();
 
               // TODO: assumes 1 target region, can we call tgt_register_lib
               // multiple times?
@@ -1328,6 +1328,8 @@ namespace {
                 // Match priority of __tgt_register_lib
                 appendToGlobalDtors(M, Func, /*Priority*/ 1);
               }
+            } else if (Tag.startswith("QUAL.OMP.DEVICE")) {
+              // TODO: Handle device selection for target regions.
             } else /* DSA Qualifiers */ {
               auto It = StringToDSA.find(Tag);
               assert(It != StringToDSA.end() && "DSA type not found in map");
@@ -1518,7 +1520,7 @@ namespace {
               }
             }
 
-            Twine DevFuncName = ".omp_offload.numba." + Fn->getName();
+            Twine DevFuncName = "__omp_offload_numba_" + Fn->getName();
             FunctionType *NumbaWrapperFnTy =
                 FunctionType::get(OMPBuilder.Void, WrapperArgsTypes,
                                   /* isVarArg */ false);
@@ -1531,24 +1533,69 @@ namespace {
 
             IRBuilder<> Builder(
                 BasicBlock::Create(M.getContext(), "entry", NumbaWrapperFunc));
-            Value *RetPtr = Builder.CreateAlloca(
-                Fn->getArg(0)->getType()->getPointerElementType());
-            Value *ExcInfo = Builder.CreateAlloca(
-                Fn->getArg(1)->getType()->getPointerElementType());
+            // Set up default arguments. Depends on the target architecture.
+            // TODO: Find a nice way to abstract this.
             FunctionCallee DevFuncCallee(Fn);
             SmallVector<Value *, 8> DevFuncArgs;
+            Triple TargetTriple(M.getTargetTriple());
+            Value *RetPtr = Builder.CreateAlloca(
+                Fn->getArg(0)->getType()->getPointerElementType());
             DevFuncArgs.push_back(RetPtr);
-            DevFuncArgs.push_back(ExcInfo);
+            if (!TargetTriple.isNVPTX()) {
+              Value *ExcInfo = Builder.CreateAlloca(
+                  Fn->getArg(1)->getType()->getPointerElementType());
+              DevFuncArgs.push_back(ExcInfo);
+            }
+
             for (auto &Arg : NumbaWrapperFunc->args())
               DevFuncArgs.push_back(&Arg);
 
+            if (TargetTriple.isNVPTX()) {
+              OpenMPIRBuilder::LocationDescription Loc(Builder);
+              auto IP = OMPBuilder.createTargetInit(Loc, /* IsSPMD */ false,
+                                          /* RequiresFullRuntime */ true);
+              Builder.restoreIP(IP);
+            }
+
             Builder.CreateCall(DevFuncCallee, DevFuncArgs);
+
+            if (TargetTriple.isNVPTX()) {
+              OpenMPIRBuilder::LocationDescription Loc(Builder);
+              OMPBuilder.createTargetDeinit(Loc, /* IsSPMD */ false,
+                                            /* RequiresFullRuntime */ true);
+            }
+
             Builder.CreateRetVoid();
 
-            Constant *OMPOffloadEntry;
-            emitOMPOffloadingEntry(M, OMPBuilder, TgtOffloadEntryTy,
-                                   DevFuncName, NumbaWrapperFunc,
-                                   OMPOffloadEntry);
+            if (TargetTriple.isNVPTX()) {
+              constexpr int OMP_TGT_GENERIC_EXEC_MODE = 1;
+              // Emit OMP device globals and metadata.
+              auto *ExecModeGV =
+                  new GlobalVariable(M, OMPBuilder.Int8, /* isConstant */ false,
+                                     GlobalValue::WeakAnyLinkage,
+                                     Builder.getInt8(OMP_TGT_GENERIC_EXEC_MODE),
+                                     DevFuncName + "_exec_mode");
+              appendToCompilerUsed(M, {ExecModeGV});
+
+              // Get "nvvm.annotations" metadata node.
+              NamedMDNode *MD = M.getOrInsertNamedMetadata("nvvm.annotations");
+
+              Metadata *MDVals[] = {ConstantAsMetadata::get(NumbaWrapperFunc),
+                                    MDString::get(M.getContext(), "kernel"),
+                                    ConstantAsMetadata::get(
+                                        ConstantInt::get(OMPBuilder.Int32, 1))};
+              // Append metadata to nvvm.annotations.
+              MD->addOperand(MDNode::get(M.getContext(), MDVals));
+
+              // Add a function attribute for the kernel.
+              Fn->addFnAttr(Attribute::get(M.getContext(), "kernel"));
+
+            } else {
+              Constant *OMPOffloadEntry;
+              emitOMPOffloadingEntry(M, OMPBuilder, TgtOffloadEntryTy,
+                                     DevFuncName, NumbaWrapperFunc,
+                                     OMPOffloadEntry);
+            }
             continue;
           }
 
@@ -1559,7 +1606,8 @@ namespace {
           Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
           Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
 
-          FunctionCallee TargetMapper = OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_mapper);
+          FunctionCallee TargetMapper = OMPBuilder.getOrCreateRuntimeFunction(
+              M, OMPRTL___tgt_target_mapper);
           OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
 
           // Emit mappings.
