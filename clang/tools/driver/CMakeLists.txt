@@ -7,6 +7,7 @@ set( LLVM_LINK_COMPONENTS
   AggressiveInstCombine
   InstCombine
   Instrumentation
+  IntrinsicsOpenMP
   MC
   MCParser
   ObjCARCOpts
