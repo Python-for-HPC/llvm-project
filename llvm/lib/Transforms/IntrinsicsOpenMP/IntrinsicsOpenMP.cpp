@@ -90,7 +90,16 @@ struct IntrinsicsOpenMP : public ModulePass {
 
       MapVector<Value *, SmallVector<FieldMappingInfo, 4>> StructMappingInfoMap;
 
-      bool IsOpenMPDevice = false;
+      bool IsDeviceTargetRegion = false;
+
+      auto IsOpenMPDeviceRuntime = [&M]() {
+        Triple TargetTriple(M.getTargetTriple());
+
+        if (TargetTriple.isNVPTX())
+          return true;
+
+        return false;
+      };
 
       CBEntry->getOperandBundlesAsDefs(OpBundles);
       // TODO: parse clauses.
@@ -170,7 +179,7 @@ struct IntrinsicsOpenMP : public ModulePass {
               DSAValueMap[TagInputs[0]] = It->second;
           }
         } else if (Tag == "OMP.DEVICE")
-          IsOpenMPDevice = true;
+          IsDeviceTargetRegion = true;
         else
           report_fatal_error("Unknown tag " + Tag);
       }
@@ -223,9 +232,14 @@ struct IntrinsicsOpenMP : public ModulePass {
       CGIntrinsicsOpenMP CGIOMP(M);
 
       if (Dir == OMPD_parallel) {
-        CGIOMP.emitOMPParallel(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                               AfterBB, FiniCB, ParRegionInfo.IfCondition,
-                               ParRegionInfo.NumThreads);
+        if (IsOpenMPDeviceRuntime())
+          CGIOMP.emitOMPParallelDevice(
+              DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB, AfterBB, FiniCB,
+              ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
+        else
+          CGIOMP.emitOMPParallel(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
+                                 AfterBB, FiniCB, ParRegionInfo.IfCondition,
+                                 ParRegionInfo.NumThreads);
       } else if (Dir == OMPD_single) {
         CGIOMP.emitOMPSingle(Fn, BBEntry, AfterBB, BodyGenCB, FiniCB);
       } else if (Dir == OMPD_critical) {
@@ -282,7 +296,7 @@ struct IntrinsicsOpenMP : public ModulePass {
       } else if (Dir == OMPD_taskwait) {
         CGIOMP.emitOMPTaskwait(BBEntry);
       } else if (Dir == OMPD_target) {
-        if (IsOpenMPDevice)
+        if (IsDeviceTargetRegion)
           CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
         else
           CGIOMP.emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn,
