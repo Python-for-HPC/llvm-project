@@ -432,7 +432,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelDevice(
   Value *ThreadID = OMPBuilder.getOrCreateThreadID(Ident);
 
   if (!IfCondition)
-    IfCondition = Constant::getNullValue(OMPBuilder.Int32);
+    // Set condition to 1 (execute in parallel) if not set.
+    IfCondition = ConstantInt::get(OMPBuilder.Int32, 1);
 
   if (!NumThreads)
     NumThreads = Constant::getNullValue(OMPBuilder.Int32);
