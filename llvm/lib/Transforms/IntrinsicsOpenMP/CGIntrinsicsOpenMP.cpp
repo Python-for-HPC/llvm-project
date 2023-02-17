@@ -65,7 +65,7 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     if (!DSAValueMap.count(V)) {
       LLVM_DEBUG(dbgs() << "Missing V " << *V << " from DSAValueMap, will privatize\n");
       assert(V->getName().startswith(".") &&
-             "Expected Numba temporary value starting with \".\"");
+             "Expected Numba temporary value, named starting with .");
       Privates.push_back(V);
     }
 
@@ -250,6 +250,12 @@ void CGIntrinsicsOpenMP::emitOMPParallel(
       LLVM_DEBUG(dbgs() << " (null)!");
     LLVM_DEBUG(dbgs() << "\n ");
 
+    if (It == DSAValueMap.end()) {
+      DSAValueMap[&Orig] = DSA_PRIVATE;
+      LLVM_DEBUG(dbgs() << "Missing V " << Orig << " from DSAValueMap, will privatize\n");
+      assert(Orig.getName().startswith(".") &&
+             "Expected Numba temporary value, named starting with .");
+    }
     assert(It != DSAValueMap.end() && "Expected Value in DSAValueMap");
 
     DSAType DSA = It->second;
