@@ -215,10 +215,12 @@ public:
 
   Twine getDevWrapperFuncPrefix() { return "__omp_offload_numba_"; }
 
-  Function *createOutlinedFunction(
-      MapVector<Value *, DSAType> &DSAValueMap, Function *OuterFn,
-      BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
-      BasicBlock *AfterBB, SmallVectorImpl<llvm::Value *> &CapturedVars);
+  Function *createOutlinedFunction(MapVector<Value *, DSAType> &DSAValueMap,
+                                   Function *OuterFn, BasicBlock *BBEntry,
+                                   BasicBlock *StartBB, BasicBlock *EndBB,
+                                   BasicBlock *AfterBB,
+                                   SmallVectorImpl<llvm::Value *> &CapturedVars,
+                                   StringRef Suffix);
 };
 
 } // namespace iomp

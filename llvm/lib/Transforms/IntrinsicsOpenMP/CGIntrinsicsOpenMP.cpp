@@ -1,6 +1,8 @@
 #include "CGIntrinsicsOpenMP.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #define DEBUG_TYPE "intrinsics-openmp"
@@ -12,7 +14,8 @@ using namespace iomp;
 Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     MapVector<Value *, DSAType> &DSAValueMap, Function *OuterFn,
     BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
-    BasicBlock *AfterBB, SmallVectorImpl<Value *> &CapturedVars) {
+    BasicBlock *AfterBB, SmallVectorImpl<Value *> &CapturedVars,
+    StringRef Suffix) {
   SmallVector<Value *, 16> Privates;
   SmallVector<Value *, 16> CapturedShared;
   SmallVector<Value *, 16> CapturedFirstprivate;
@@ -37,6 +40,35 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
   SmallVector<BasicBlock *, 8> BlockVector;
   OI.collectBlocks(BlockSet, BlockVector);
 
+  CodeExtractorAnalysisCache CEAC(*OuterFn);
+    CodeExtractor Extractor(BlockVector, /* DominatorTree */ nullptr,
+                          /* AggregateArgs */ false,
+                          /* BlockFrequencyInfo */ nullptr,
+                          /* BranchProbabilityInfo */ nullptr,
+                          /* AssumptionCache */ nullptr,
+                          /* AllowVarArgs */ true,
+                          /* AllowAlloca */ true,
+                          /* Suffix */ ".");
+
+  // Find inputs to, outputs from the code region.
+  BasicBlock *CommonExit = nullptr;
+  SetVector<Value *> Inputs, Outputs, SinkingCands, HoistingCands;
+  Extractor.findAllocas(CEAC, SinkingCands, HoistingCands, CommonExit);
+  Extractor.findInputsOutputs(Inputs, Outputs, SinkingCands);
+
+  assert(Outputs.empty() && "Expected empty outputs from outlined region");
+  assert(SinkingCands.empty() && "Expected empty alloca sinking candidates");
+
+  // Scan Inputs and define any missing values as Privates. Those values must
+  // correspond to Numba-generated temporaries that should be privatized.
+  for (auto *V : Inputs)
+    if (!DSAValueMap.count(V)) {
+      LLVM_DEBUG(dbgs() << "Missing V " << *V << " from DSAValueMap, will privatize\n");
+      assert(V->getName().startswith(".") &&
+             "Expected Numba temporary value starting with \".\"");
+      Privates.push_back(V);
+    }
+
   SmallVector<Type *, 16> Params;
   // tid
   Params.push_back(OMPBuilder.Int32Ptr);
@@ -51,7 +83,7 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
       FunctionType::get(OMPBuilder.Void, Params, /* isVarArgs */ false);
   Function *OutlinedFn =
       Function::Create(OutlinedFnTy, GlobalValue::InternalLinkage,
-                       OuterFn->getName() + ".omp_outlined", M);
+                       OuterFn->getName() + Suffix, M);
 
   // Name the parameters.
   OutlinedFn->arg_begin()->setName("global_tid");
@@ -144,8 +176,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
   for (auto *BB : BlockSet)
     BB->moveAfter(&OutlinedFn->getEntryBlock());
 
-  dbgs() << "=== Dump OutlinedFn\n"
-         << *OutlinedFn << "=== End of Dump OutlinedFn\n";
+  LLVM_DEBUG(dbgs() << "=== Dump OutlinedFn\n"
+                    << *OutlinedFn << "=== End of Dump OutlinedFn\n");
 
   /*
   const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
@@ -330,8 +362,9 @@ void CGIntrinsicsOpenMP::emitOMPParallelDevice(
     Value *NumThreads) {
   // Extract parallel region
   SmallVector<Value *, 16> CapturedVars;
-  Function *OutlinedFn = createOutlinedFunction(
-      DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB, CapturedVars);
+  Function *OutlinedFn =
+      createOutlinedFunction(DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB,
+                             CapturedVars, ".omp_outlined_parallel");
 
   // Create wrapper for worker threads
   SmallVector<Type *, 2> Params;
@@ -371,8 +404,6 @@ void CGIntrinsicsOpenMP::emitOMPParallelDevice(
   OutlinedFnArgs.push_back(ZeroAddr);
 
   for (size_t Idx = 0; Idx < CapturedVars.size(); ++Idx) {
-    dbgs() << "CapturedVar " << Idx << " " << *CapturedVars[Idx] << "\n";
-    dbgs() << "OutlinedArg " << *OutlinedFn->getArg(Idx + 2) << "\n";
     Value *LoadGlobalArgs =
         OMPBuilder.Builder.CreateLoad(OMPBuilder.Int8PtrPtr, GlobalArgs);
     Value *GEP = OMPBuilder.Builder.CreateConstInBoundsGEP1_64(
@@ -1572,8 +1603,9 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDevice(
     BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
     BasicBlock *AfterBB) {
   SmallVector<Value *, 16> CapturedVars;
-  Function *OutlinedFn = createOutlinedFunction(
-      DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB, CapturedVars);
+  Function *OutlinedFn =
+      createOutlinedFunction(DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB,
+                             CapturedVars, ".omp_outlined_team");
 
   // Set up the call to the teams outlined function.
   BBEntry->getTerminator()->eraseFromParent();
@@ -1602,31 +1634,27 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDevice(
   FunctionCallee TeamsOutlinedFn(OutlinedFn);
   SmallVector<Value *, 8> Args;
   Args.append({ThreadIDAddr, ZeroAddr});
-  dbgs() << "CapturedVars.size() " << CapturedVars.size() << "\n";
   Args.append(CapturedVars);
-  for(Value *Arg : Args)
-    dbgs() << "Arg " << *Arg << "\n";
   OMPBuilder.Builder.CreateCall(TeamsOutlinedFn, Args);
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 
   LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
                     << *Fn << "=== End of Dump OuterFn\n");
-  dbgs() << "=== Dump OuterFn\n"
-                    << *Fn << "=== End of Dump OuterFn\n";
-
 
   if (verifyFunction(*Fn, &errs()))
     report_fatal_error("Verification of OuterFn failed!");
 }
 
-void CGIntrinsicsOpenMP::emitOMPTeams(
-    MapVector<Value *, DSAType> &DSAValueMap, const DebugLoc &DL, Function *Fn,
-    BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
-    BasicBlock *AfterBB, Value *NumTeams, Value *ThreadLimit) {
+void CGIntrinsicsOpenMP::emitOMPTeams(MapVector<Value *, DSAType> &DSAValueMap,
+                                      const DebugLoc &DL, Function *Fn,
+                                      BasicBlock *BBEntry, BasicBlock *StartBB,
+                                      BasicBlock *EndBB, BasicBlock *AfterBB,
+                                      Value *NumTeams, Value *ThreadLimit) {
   SmallVector<Value *, 16> CapturedVars;
-  Function *OutlinedFn = createOutlinedFunction(
-      DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB, CapturedVars);
+  Function *OutlinedFn =
+      createOutlinedFunction(DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB,
+                             CapturedVars, ".omp_outlined_team");
 
   // Set up the call to the teams outlined function.
   BBEntry->getTerminator()->eraseFromParent();
@@ -1642,8 +1670,6 @@ void CGIntrinsicsOpenMP::emitOMPTeams(
 
   assert(Ident && "Expected non-null Ident");
 
-// TODO: use num_teams, thread_limit.
-#if 0
   // Emit call to set the number of teams and thread limit.
   if (NumTeams || ThreadLimit) {
     NumTeams = (NumTeams ? NumTeams : Constant::getNullValue(OMPBuilder.Int32));
@@ -1654,29 +1680,22 @@ void CGIntrinsicsOpenMP::emitOMPTeams(
     OMPBuilder.Builder.CreateCall(KmpcPushNumTeams,
                                   {Ident, ThreadID, NumTeams, ThreadLimit});
   }
-  #endif
 
   FunctionCallee ForkTeams =
       OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_fork_teams);
 
   SmallVector<Value *, 8> Args;
   Value *NumCapturedVars = OMPBuilder.Builder.getInt32(CapturedVars.size());
-  dbgs() << "CapturedVars.size() " << CapturedVars.size() << "\n";
   Args.append({Ident, NumCapturedVars,
                OMPBuilder.Builder.CreateBitCast(OutlinedFn,
                                                 OMPBuilder.ParallelTaskPtr)});
   Args.append(CapturedVars);
-  for(Value *Arg : Args)
-    dbgs() << "Arg " << *Arg << "\n";
   OMPBuilder.Builder.CreateCall(ForkTeams, Args);
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 
   LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
                     << *Fn << "=== End of Dump OuterFn\n");
-  dbgs() << "=== Dump OuterFn\n"
-                    << *Fn << "=== End of Dump OuterFn\n";
-
 
   if (verifyFunction(*Fn, &errs()))
     report_fatal_error("Verification of OuterFn failed!");
