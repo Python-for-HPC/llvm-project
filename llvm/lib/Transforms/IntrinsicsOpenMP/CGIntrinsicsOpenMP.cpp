@@ -436,7 +436,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelDevice(
     IfCondition = ConstantInt::get(OMPBuilder.Int32, 1);
 
   if (!NumThreads)
-    NumThreads = Constant::getNullValue(OMPBuilder.Int32);
+    NumThreads = ConstantInt::get(OMPBuilder.Int32, -1);
 
   FunctionCallee KmpcParallel51 =
       OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_parallel_51);
@@ -1427,8 +1427,8 @@ void CGIntrinsicsOpenMP::emitOMPTarget(
     StringRef DevFuncName, ConstantDataArray *ELF, Function *Fn,
     BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
     MapVector<Value *, DSAType> &DSAValueMap,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
-        &StructMappingInfoMap) {
+    MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+    Value *NumTeams, Value *ThreadLimit) {
 
   Twine DevWrapperFuncName = getDevWrapperFuncPrefix() + DevFuncName;
 
@@ -1441,8 +1441,12 @@ void CGIntrinsicsOpenMP::emitOMPTarget(
   Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
   Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
 
+  // TODO: should we use target_mapper without teams or the more general
+  // target_teams_mapper. Does the former buy us anything (less overhead?)
+  //FunctionCallee TargetMapper =
+  //    OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_mapper);
   FunctionCallee TargetMapper =
-      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_mapper);
+      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_teams_mapper);
   OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
 
   // Emit mappings.
@@ -1461,7 +1465,7 @@ void CGIntrinsicsOpenMP::emitOMPTarget(
        OffloadingMappingArgs.Sizes, OffloadingMappingArgs.MapTypes,
        OffloadingMappingArgs.MapNames,
        // TODO: offload_mappers is null for now.
-       Constant::getNullValue(OMPBuilder.VoidPtrPtr)});
+       Constant::getNullValue(OMPBuilder.VoidPtrPtr), NumTeams, ThreadLimit});
   auto *Failed = OMPBuilder.Builder.CreateIsNotNull(OffloadResult);
   OMPBuilder.Builder.CreateCondBr(Failed, StartBB, EndBB);
   BBEntry->getTerminator()->eraseFromParent();
@@ -1508,14 +1512,6 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
   FunctionCallee DevFuncCallee(Fn);
   SmallVector<Value *, 8> DevFuncArgs;
   Triple TargetTriple(M.getTargetTriple());
-  Value *RetPtr =
-      Builder.CreateAlloca(Fn->getArg(0)->getType()->getPointerElementType());
-  DevFuncArgs.push_back(RetPtr);
-  if (!TargetTriple.isNVPTX()) {
-    Value *ExcInfo =
-        Builder.CreateAlloca(Fn->getArg(1)->getType()->getPointerElementType());
-    DevFuncArgs.push_back(ExcInfo);
-  }
 
   for (auto &Arg : NumbaWrapperFunc->args())
     DevFuncArgs.push_back(&Arg);
@@ -1567,4 +1563,121 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
   }
   // TODO: add llvm.module.flags for "openmp", "openmp-device" to enable
   // OpenMPOpt.
+  M.addModuleFlag(llvm::Module::Max, "openmp", 50);
+  M.addModuleFlag(llvm::Module::Max, "openmp-device", 50);
+}
+
+void CGIntrinsicsOpenMP::emitOMPTeamsDevice(
+    MapVector<Value *, DSAType> &DSAValueMap, const DebugLoc &DL, Function *Fn,
+    BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+    BasicBlock *AfterBB) {
+  SmallVector<Value *, 16> CapturedVars;
+  Function *OutlinedFn = createOutlinedFunction(
+      DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB, CapturedVars);
+
+  // Set up the call to the teams outlined function.
+  BBEntry->getTerminator()->eraseFromParent();
+  OpenMPIRBuilder::LocationDescription Loc(
+      InsertPointTy(BBEntry, BBEntry->end()), DL);
+
+  Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+  OMPBuilder.Builder.restoreIP(Loc.IP);
+  OMPBuilder.Builder.SetCurrentDebugLocation(Loc.DL);
+
+  Value *Ident = OMPBuilder.getOrCreateIdent(SrcLocStr);
+  Value *ThreadID = OMPBuilder.getOrCreateThreadID(Ident);
+
+  assert(Ident && "Expected non-null Ident");
+  assert(ThreadID && "Expected non-null ThreadID");
+
+  // Create global_tid, bound_tid (zero) to pass to the teams outlined function.
+  AllocaInst *ThreadIDAddr =
+      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, "threadid.addr");
+  AllocaInst *ZeroAddr =
+      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, "zero.addr");
+  OMPBuilder.Builder.CreateStore(ThreadID, ThreadIDAddr);
+  OMPBuilder.Builder.CreateStore(Constant::getNullValue(OMPBuilder.Int32),
+                                 ZeroAddr);
+
+  FunctionCallee TeamsOutlinedFn(OutlinedFn);
+  SmallVector<Value *, 8> Args;
+  Args.append({ThreadIDAddr, ZeroAddr});
+  dbgs() << "CapturedVars.size() " << CapturedVars.size() << "\n";
+  Args.append(CapturedVars);
+  for(Value *Arg : Args)
+    dbgs() << "Arg " << *Arg << "\n";
+  OMPBuilder.Builder.CreateCall(TeamsOutlinedFn, Args);
+
+  OMPBuilder.Builder.CreateBr(AfterBB);
+
+  LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
+                    << *Fn << "=== End of Dump OuterFn\n");
+  dbgs() << "=== Dump OuterFn\n"
+                    << *Fn << "=== End of Dump OuterFn\n";
+
+
+  if (verifyFunction(*Fn, &errs()))
+    report_fatal_error("Verification of OuterFn failed!");
+}
+
+void CGIntrinsicsOpenMP::emitOMPTeams(
+    MapVector<Value *, DSAType> &DSAValueMap, const DebugLoc &DL, Function *Fn,
+    BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+    BasicBlock *AfterBB, Value *NumTeams, Value *ThreadLimit) {
+  SmallVector<Value *, 16> CapturedVars;
+  Function *OutlinedFn = createOutlinedFunction(
+      DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB, CapturedVars);
+
+  // Set up the call to the teams outlined function.
+  BBEntry->getTerminator()->eraseFromParent();
+  OpenMPIRBuilder::LocationDescription Loc(
+      InsertPointTy(BBEntry, BBEntry->end()), DL);
+
+  Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+  OMPBuilder.Builder.restoreIP(Loc.IP);
+  OMPBuilder.Builder.SetCurrentDebugLocation(Loc.DL);
+
+  Value *Ident = OMPBuilder.getOrCreateIdent(SrcLocStr);
+  Value *ThreadID = OMPBuilder.getOrCreateThreadID(Ident);
+
+  assert(Ident && "Expected non-null Ident");
+
+// TODO: use num_teams, thread_limit.
+#if 0
+  // Emit call to set the number of teams and thread limit.
+  if (NumTeams || ThreadLimit) {
+    NumTeams = (NumTeams ? NumTeams : Constant::getNullValue(OMPBuilder.Int32));
+    ThreadLimit =
+        (ThreadLimit ? ThreadLimit : Constant::getNullValue(OMPBuilder.Int32));
+    FunctionCallee KmpcPushNumTeams =
+        OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_push_num_teams);
+    OMPBuilder.Builder.CreateCall(KmpcPushNumTeams,
+                                  {Ident, ThreadID, NumTeams, ThreadLimit});
+  }
+  #endif
+
+  FunctionCallee ForkTeams =
+      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_fork_teams);
+
+  SmallVector<Value *, 8> Args;
+  Value *NumCapturedVars = OMPBuilder.Builder.getInt32(CapturedVars.size());
+  dbgs() << "CapturedVars.size() " << CapturedVars.size() << "\n";
+  Args.append({Ident, NumCapturedVars,
+               OMPBuilder.Builder.CreateBitCast(OutlinedFn,
+                                                OMPBuilder.ParallelTaskPtr)});
+  Args.append(CapturedVars);
+  for(Value *Arg : Args)
+    dbgs() << "Arg " << *Arg << "\n";
+  OMPBuilder.Builder.CreateCall(ForkTeams, Args);
+
+  OMPBuilder.Builder.CreateBr(AfterBB);
+
+  LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
+                    << *Fn << "=== End of Dump OuterFn\n");
+  dbgs() << "=== Dump OuterFn\n"
+                    << *Fn << "=== End of Dump OuterFn\n";
+
+
+  if (verifyFunction(*Fn, &errs()))
+    report_fatal_error("Verification of OuterFn failed!");
 }

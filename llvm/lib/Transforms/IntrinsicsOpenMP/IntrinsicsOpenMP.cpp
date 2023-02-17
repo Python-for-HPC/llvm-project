@@ -53,8 +53,8 @@ struct IntrinsicsOpenMP : public ModulePass {
       return false;
     }
 
-    LLVM_DEBUG(dbgs() << "=== Dump module\n"
-                      << M << "=== End of Dump module\n");
+    LLVM_DEBUG(dbgs() << "=== Dump Module\n"
+                      << M << "=== End of Dump Module\n");
 
     // Iterate over all calls to directive intrinsics and transform code
     // using OpenMPIRBuilder for lowering.
@@ -86,7 +86,14 @@ struct IntrinsicsOpenMP : public ModulePass {
       struct {
         StringRef DevFuncName;
         ConstantDataArray *ELF;
+        Value *NumTeams = nullptr;
+        Value *ThreadLimit = nullptr;
       } TargetInfo;
+
+      struct {
+        Value *NumTeams = nullptr;
+        Value *ThreadLimit = nullptr;
+      } TeamsInfo;
 
       MapVector<Value *, SmallVector<FieldMappingInfo, 4>> StructMappingInfoMap;
 
@@ -160,6 +167,31 @@ struct IntrinsicsOpenMP : public ModulePass {
             TargetInfo.ELF = ELF;
           } else if (Tag.startswith("QUAL.OMP.DEVICE")) {
             // TODO: Handle device selection for target regions.
+          } else if (Tag.startswith("QUAL.OMP.NUM_TEAMS")) {
+            assert(O.input_size() == 1 && "Expected single NumTeams value");
+            switch(Dir) {
+              case OMPD_target:
+                TargetInfo.NumTeams = TagInputs[0];
+                break;
+              case OMPD_teams:
+                TeamsInfo.NumTeams = TagInputs[0];
+                break;
+              default:
+                report_fatal_error("Unsupported qualifier in directive");
+            }
+          } else if (Tag.startswith("QUAL.OMP.THREAD_LIMIT")) {
+            assert(O.input_size() == 1 && "Expected single ThreadLimit value");
+             switch(Dir) {
+              case OMPD_target:
+                TargetInfo.ThreadLimit = TagInputs[0];
+                break;
+              case OMPD_teams:
+                TeamsInfo.ThreadLimit = TagInputs[0];
+                break;
+              default:
+                report_fatal_error("Unsupported qualifier in directive");
+            }
+            TargetInfo.ThreadLimit = TagInputs[0];
           } else /* DSA Qualifiers */ {
             auto It = StringToDSA.find(Tag);
             assert(It != StringToDSA.end() && "DSA type not found in map");
@@ -301,7 +333,20 @@ struct IntrinsicsOpenMP : public ModulePass {
         else
           CGIOMP.emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn,
                                BBEntry, StartBB, EndBB, DSAValueMap,
-                               StructMappingInfoMap);
+                               StructMappingInfoMap, TargetInfo.NumTeams,
+                               TargetInfo.ThreadLimit);
+      }
+      else if (Dir == OMPD_teams) {
+        if (IsOpenMPDeviceRuntime())
+          CGIOMP.emitOMPTeamsDevice(DSAValueMap, DL, Fn, BBEntry, StartBB,
+                                    EndBB, AfterBB);
+        else
+          CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
+                              AfterBB, TeamsInfo.NumTeams,
+                              TeamsInfo.ThreadLimit);
+      } else if (Dir == OMPD_target_teams) {
+        dbgs() << "Not implemented yet!\n";
+        assert(false && "NIY");
       } else {
         LLVM_DEBUG(dbgs() << "Unknown directive " << *CBEntry << "\n");
         assert(false && "Unknown directive");

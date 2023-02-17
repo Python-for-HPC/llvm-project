@@ -37,7 +37,10 @@ static const DenseMap<StringRef, Directive> StringToDir = {
     {"DIR.OMP.PARALLEL.LOOP", OMPD_parallel_for},
     {"DIR.OMP.TASK", OMPD_task},
     {"DIR.OMP.TASKWAIT", OMPD_taskwait},
-    {"DIR.OMP.TARGET", OMPD_target}};
+    {"DIR.OMP.TARGET", OMPD_target},
+    {"DIR.OMP.TEAMS", OMPD_teams},
+    {"DIR.OMP.TARGET.TEAMS", OMPD_target_teams},
+    };
 
 // TODO: add more reduction operators.
 static const DenseMap<StringRef, DSAType> StringToDSA = {
@@ -191,10 +194,21 @@ public:
                      BasicBlock *EndBB,
                      MapVector<Value *, DSAType> &DSAValueMap,
                      MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
-                         &StructMappingInfoMap);
+                         &StructMappingInfoMap,
+                     Value *NumTeams, Value *ThreadLimit);
 
   void emitOMPTargetDevice(Function *Fn,
                            MapVector<Value *, DSAType> &DSAValueMap);
+
+  void emitOMPTeams(MapVector<Value *, DSAType> &DSAValueMap,
+                    const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry,
+                    BasicBlock *StartBB, BasicBlock *EndBB, BasicBlock *AfterBB,
+                    Value *NumTeams, Value *ThreadLimit);
+
+  void emitOMPTeamsDevice(MapVector<Value *, DSAType> &DSAValueMap,
+                          const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry,
+                          BasicBlock *StartBB, BasicBlock *EndBB,
+                          BasicBlock *AfterBB);
 
   GlobalVariable *emitOffloadingGlobals(StringRef DevWrapperFuncName,
                                         ConstantDataArray *ELF);
