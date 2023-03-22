@@ -1517,6 +1517,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
     Value *V = It.first;
     DSAType DSA = It.second;
 
+    LLVM_DEBUG(dbgs() << "V " << *V << " DSA " << DSA << "\n");
     switch (DSA) {
     case DSA_FIRSTPRIVATE:
       WrapperArgsTypes.push_back(V->getType()->getPointerElementType());
@@ -1530,6 +1531,9 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
       WrapperArgsNames.push_back(V->getName());
     }
   }
+
+  for(auto &Arg : WrapperArgsNames)
+    LLVM_DEBUG(dbgs() << "[IOMP] Adding wrapper arg " << Arg << "\n");
 
   Twine DevWrapperFuncName = getDevWrapperFuncPrefix() + Fn->getName();
   FunctionType *NumbaWrapperFnTy =

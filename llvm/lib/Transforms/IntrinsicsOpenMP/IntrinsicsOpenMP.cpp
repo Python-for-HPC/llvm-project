@@ -176,6 +176,10 @@ struct IntrinsicsOpenMP : public ModulePass {
               case OMPD_teams:
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
+              case OMPD_target_teams:
+                TargetInfo.NumTeams = TagInputs[0];
+                TeamsInfo.NumTeams = TagInputs[0];
+                break;
               default:
                 report_fatal_error("Unsupported qualifier in directive");
             }
@@ -188,10 +192,13 @@ struct IntrinsicsOpenMP : public ModulePass {
               case OMPD_teams:
                 TeamsInfo.ThreadLimit = TagInputs[0];
                 break;
+              case OMPD_target_teams:
+                TargetInfo.ThreadLimit = TagInputs[0];
+                TeamsInfo.ThreadLimit = TagInputs[0];
+                break;
               default:
                 report_fatal_error("Unsupported qualifier in directive");
             }
-            TargetInfo.ThreadLimit = TagInputs[0];
           } else /* DSA Qualifiers */ {
             auto It = StringToDSA.find(Tag);
             assert(It != StringToDSA.end() && "DSA type not found in map");
@@ -345,8 +352,22 @@ struct IntrinsicsOpenMP : public ModulePass {
                               AfterBB, TeamsInfo.NumTeams,
                               TeamsInfo.ThreadLimit);
       } else if (Dir == OMPD_target_teams) {
-        dbgs() << "Not implemented yet!\n";
-        assert(false && "NIY");
+        if (IsDeviceTargetRegion) {
+          CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
+          CGIOMP.emitOMPTeamsDevice(DSAValueMap, DL, Fn, BBEntry, StartBB,
+                                    EndBB, AfterBB);
+        }
+        else {
+          CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
+                              AfterBB, TeamsInfo.NumTeams,
+                              TeamsInfo.ThreadLimit);
+          StartBB = SplitBlock(BBEntry, &*BBEntry->getFirstInsertionPt());
+          EndBB = AfterBB;
+          CGIOMP.emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn,
+                               BBEntry, StartBB, EndBB, DSAValueMap,
+                               StructMappingInfoMap, TargetInfo.NumTeams,
+                               TargetInfo.ThreadLimit);
+        }
       } else {
         LLVM_DEBUG(dbgs() << "Unknown directive " << *CBEntry << "\n");
         assert(false && "Unknown directive");
