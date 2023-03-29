@@ -978,7 +978,7 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingEntry(const Twine &DevFuncName,
 void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
     InsertPointTy AllocaIP, MapVector<Value *, DSAType> &DSAValueMap,
     MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
-    OffloadingMappingArgsTy &OffloadingMappingArgs) {
+    OffloadingMappingArgsTy &OffloadingMappingArgs, bool IsTargetRegion) {
 
   struct MapperInfo {
     Value *BasePtr;
@@ -1016,25 +1016,34 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
     MapperInfos.push_back({BasePtr, Ptr, Size});
   };
 
-  auto GetMapType = [](DSAType DSA) {
+  auto GetMapType = [IsTargetRegion](DSAType DSA) {
     uint64_t MapType;
     // Determine the map type, completely or partly (structs).
     switch (DSA) {
     case DSA_FIRSTPRIVATE:
-      MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_LITERAL;
+      MapType = OMP_TGT_MAPTYPE_LITERAL;
+      if (IsTargetRegion)
+        MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
       break;
     case DSA_MAP_TO:
-      MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_TO;
+      MapType = OMP_TGT_MAPTYPE_TO;
+      if (IsTargetRegion)
+        MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
       break;
     case DSA_MAP_FROM:
-      MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_FROM;
+      MapType = OMP_TGT_MAPTYPE_FROM;
+      if (IsTargetRegion)
+        MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
       break;
     case DSA_MAP_TOFROM:
-      MapType = OMP_TGT_MAPTYPE_TARGET_PARAM | OMP_TGT_MAPTYPE_TO |
-                OMP_TGT_MAPTYPE_FROM;
+      MapType = OMP_TGT_MAPTYPE_TO | OMP_TGT_MAPTYPE_FROM;
+      if (IsTargetRegion)
+        MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
       break;
     case DSA_MAP_STRUCT:
-      MapType = OMP_TGT_MAPTYPE_TARGET_PARAM;
+      MapType = OMP_TGT_MAPTYPE_NONE;
+      if (IsTargetRegion)
+        MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
       break;
     case DSA_MAP_TO_STRUCT:
       MapType = OMP_TGT_MAPTYPE_TO;
@@ -1491,7 +1500,7 @@ void CGIntrinsicsOpenMP::emitOMPTarget(
   InsertPointTy AllocaIP(&Fn->getEntryBlock(),
                          Fn->getEntryBlock().getFirstInsertionPt());
   emitOMPOffloadingMappings(AllocaIP, DSAValueMap, StructMappingInfoMap,
-                            OffloadingMappingArgs);
+                            OffloadingMappingArgs, /* isTargetRegion */ true);
 
   auto *OffloadResult = OMPBuilder.Builder.CreateCall(
       TargetMapper,
@@ -1709,4 +1718,207 @@ void CGIntrinsicsOpenMP::emitOMPTeams(MapVector<Value *, DSAType> &DSAValueMap,
 
   if (verifyFunction(*Fn, &errs()))
     report_fatal_error("Verification of OuterFn failed!");
+}
+
+void CGIntrinsicsOpenMP::emitOMPTargetEnterData(
+    Function *Fn, BasicBlock *BBEntry, MapVector<Value *, DSAType> &DSAValueMap,
+    MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
+        &StructMappingInfoMap) {
+
+  const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
+  OpenMPIRBuilder::LocationDescription Loc(
+      InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()), DL);
+  Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+  Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
+
+  FunctionCallee TargetDataBeginMapper =
+      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_data_begin_mapper);
+  OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
+
+  // Emit mappings.
+  OffloadingMappingArgsTy OffloadingMappingArgs;
+  InsertPointTy AllocaIP(&Fn->getEntryBlock(),
+                         Fn->getEntryBlock().getFirstInsertionPt());
+  emitOMPOffloadingMappings(AllocaIP, DSAValueMap, StructMappingInfoMap,
+                            OffloadingMappingArgs, /* IsTargetRegion */ false);
+
+  OMPBuilder.Builder.CreateCall(
+      TargetDataBeginMapper,
+      {SrcLoc, ConstantInt::get(OMPBuilder.Int64, -1),
+       ConstantInt::get(OMPBuilder.Int32, OffloadingMappingArgs.Size),
+       OffloadingMappingArgs.BasePtrs, OffloadingMappingArgs.Ptrs,
+       OffloadingMappingArgs.Sizes, OffloadingMappingArgs.MapTypes,
+       OffloadingMappingArgs.MapNames,
+       // TODO: offload_mappers is null for now.
+       Constant::getNullValue(OMPBuilder.VoidPtrPtr)});
+}
+
+void CGIntrinsicsOpenMP::emitOMPTargetExitData(
+    Function *Fn, BasicBlock *BBEntry, MapVector<Value *, DSAType> &DSAValueMap,
+    MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
+        &StructMappingInfoMap) {
+
+  const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
+  OpenMPIRBuilder::LocationDescription Loc(
+      InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()), DL);
+  Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+  Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
+
+  FunctionCallee TargetDataEndMapper =
+      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_data_end_mapper);
+  OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
+
+  // Emit mappings.
+  OffloadingMappingArgsTy OffloadingMappingArgs;
+  InsertPointTy AllocaIP(&Fn->getEntryBlock(),
+                         Fn->getEntryBlock().getFirstInsertionPt());
+  emitOMPOffloadingMappings(AllocaIP, DSAValueMap, StructMappingInfoMap,
+                            OffloadingMappingArgs, /* IsTargetRegion */ false);
+
+  OMPBuilder.Builder.CreateCall(
+      TargetDataEndMapper,
+      {SrcLoc, ConstantInt::get(OMPBuilder.Int64, -1),
+       ConstantInt::get(OMPBuilder.Int32, OffloadingMappingArgs.Size),
+       OffloadingMappingArgs.BasePtrs, OffloadingMappingArgs.Ptrs,
+       OffloadingMappingArgs.Sizes, OffloadingMappingArgs.MapTypes,
+       OffloadingMappingArgs.MapNames,
+       // TODO: offload_mappers is null for now.
+       Constant::getNullValue(OMPBuilder.VoidPtrPtr)});
+}
+
+void CGIntrinsicsOpenMP::emitOMPDistribute(MapVector<Value *, DSAType> &DSAValueMap,
+                                    Value *IV, Value *UB, BasicBlock *PreHeader,
+                                    BasicBlock *Exit, OMPScheduleType Sched,
+                                    Value *Chunk) {
+  Type *IVTy = IV->getType()->getPointerElementType();
+
+  auto GetKmpcForStaticInit = [&]() -> FunctionCallee {
+    LLVM_DEBUG(dbgs() << "Type " << *IVTy << "\n");
+    unsigned Bitwidth = IVTy->getIntegerBitWidth();
+    LLVM_DEBUG(dbgs() << "Bitwidth " << Bitwidth << "\n");
+    if (Bitwidth == 32)
+      return OMPBuilder.getOrCreateRuntimeFunction(
+          M, OMPRTL___kmpc_for_static_init_4u);
+    if (Bitwidth == 64)
+      return OMPBuilder.getOrCreateRuntimeFunction(
+          M, OMPRTL___kmpc_for_static_init_8u);
+    llvm_unreachable("unknown OpenMP loop iterator bitwidth");
+  };
+
+  FunctionCallee KmpcForStaticInit = GetKmpcForStaticInit();
+  FunctionCallee KmpcForStaticFini =
+      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_for_static_fini);
+
+  const DebugLoc DL = PreHeader->getTerminator()->getDebugLoc();
+  OpenMPIRBuilder::LocationDescription Loc(
+      InsertPointTy(PreHeader, PreHeader->getTerminator()->getIterator()), DL);
+  Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc);
+  Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr);
+
+  // Create allocas for static init values.
+  InsertPointTy AllocaIP(PreHeader, PreHeader->getFirstInsertionPt());
+  Type *I32Type = Type::getInt32Ty(M.getContext());
+  OMPBuilder.Builder.restoreIP(AllocaIP);
+  Value *PLastIter =
+      OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, "omp_lastiter");
+  Value *PLowerBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_lb");
+  Value *PStride = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_stride");
+  Value *PUpperBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_ub");
+
+  OpenMPIRBuilder::OutlineInfo OI;
+  OI.EntryBB = PreHeader;
+  OI.ExitBB = Exit;
+  SmallPtrSet<BasicBlock *, 8> BlockSet;
+  SmallVector<BasicBlock *, 8> BlockVector;
+  OI.collectBlocks(BlockSet, BlockVector);
+
+  // Do privatization.
+  // TODO: create PrivCBHelper and re-use PrivCB from emitOMPParallel.
+  for (auto &It : DSAValueMap) {
+    Value *Orig = It.first;
+    DSAType DSA = It.second;
+    Value *ReplacementValue = nullptr;
+    Type *VTy = Orig->getType()->getPointerElementType();
+
+    if (DSA == DSA_SHARED)
+      continue;
+
+    // Store previous uses to set them to the ReplacementValue after
+    // privatization codegen.
+    SetVector<Use *> Uses;
+    for (Use &U : Orig->uses())
+      if (auto *UserI = dyn_cast<Instruction>(U.getUser()))
+        if (BlockSet.count(UserI->getParent()))
+          Uses.insert(&U);
+
+    OMPBuilder.Builder.restoreIP(AllocaIP);
+    if (DSA == DSA_PRIVATE) {
+      ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+          VTy, /*ArraySize */ nullptr, Orig->getName() + ".distribute.priv");
+      OMPBuilder.Builder.CreateStore(Constant::getNullValue(VTy),
+                                     ReplacementValue);
+    } else if (DSA == DSA_FIRSTPRIVATE) {
+      Value *V = OMPBuilder.Builder.CreateLoad(
+          VTy, Orig, Orig->getName() + ".distribute.firstpriv.reload");
+      ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+          VTy, /*ArraySize */ nullptr,
+          Orig->getName() + ".distribute.firstpriv.copy");
+      OMPBuilder.Builder.CreateStore(V, ReplacementValue);
+      // ReplacementValue = Orig;
+    } else
+      assert(false && "Unsupported privatization");
+
+    assert(ReplacementValue && "Expected non-null ReplacementValue");
+
+    for (Use *UPtr : Uses)
+      UPtr->set(ReplacementValue);
+  }
+
+  OMPBuilder.Builder.SetInsertPoint(PreHeader->getTerminator());
+
+  // Store the initial normalized upper bound to PUpperBound.
+  Value *LoadUB =
+      OMPBuilder.Builder.CreateLoad(UB->getType()->getPointerElementType(), UB);
+  OMPBuilder.Builder.CreateStore(LoadUB, PUpperBound);
+
+  Constant *Zero = ConstantInt::get(IVTy, 0);
+  Constant *One = ConstantInt::get(IVTy, 1);
+  OMPBuilder.Builder.CreateStore(Zero, PLowerBound);
+  OMPBuilder.Builder.CreateStore(One, PStride);
+
+  // If Chunk is not specified (nullptr), default to one, complying with the
+  // OpenMP specification.
+  if (!Chunk)
+    Chunk = One;
+  Value *ChunkCast =
+      OMPBuilder.Builder.CreateIntCast(Chunk, IVTy, /*isSigned*/ false);
+
+  Value *ThreadNum = OMPBuilder.getOrCreateThreadID(SrcLoc);
+
+  // TODO: add more scheduling types.
+  Constant *SchedulingType = ConstantInt::get(I32Type, static_cast<int>(Sched));
+
+  LLVM_DEBUG(dbgs() << "=== SchedulingType " << *SchedulingType << "\n");
+  LLVM_DEBUG(dbgs() << "=== PLowerBound " << *PLowerBound << "\n");
+  LLVM_DEBUG(dbgs() << "=== PUpperBound " << *PUpperBound << "\n");
+  LLVM_DEBUG(dbgs() << "=== PStride " << *PStride << "\n");
+  LLVM_DEBUG(dbgs() << "=== Incr " << *One << "\n");
+  LLVM_DEBUG(dbgs() << "=== ChunkCast " << *ChunkCast << "\n");
+  OMPBuilder.Builder.CreateCall(
+      KmpcForStaticInit, {SrcLoc, ThreadNum, SchedulingType, PLastIter,
+                          PLowerBound, PUpperBound, PStride, One, ChunkCast});
+  // Load returned upper bound to UB.
+  Value *LoadPUpperBound = OMPBuilder.Builder.CreateLoad(
+      PUpperBound->getType()->getPointerElementType(), PUpperBound);
+  OMPBuilder.Builder.CreateStore(LoadPUpperBound, UB);
+  // Add lower bound to IV.
+  Value *LowerBound = OMPBuilder.Builder.CreateLoad(IVTy, PLowerBound);
+  Value *LoadIV = OMPBuilder.Builder.CreateLoad(IVTy, IV);
+  Value *UpdateIV = OMPBuilder.Builder.CreateAdd(LoadIV, LowerBound);
+  OMPBuilder.Builder.CreateStore(UpdateIV, IV);
+
+  // Add fini call after the loop exit block.
+  BasicBlock *FiniBB = SplitBlock(Exit, &*Exit->getFirstInsertionPt());
+  OMPBuilder.Builder.SetInsertPoint(FiniBB, FiniBB->getFirstInsertionPt());
+  OMPBuilder.Builder.CreateCall(KmpcForStaticFini, {SrcLoc, ThreadNum});
 }

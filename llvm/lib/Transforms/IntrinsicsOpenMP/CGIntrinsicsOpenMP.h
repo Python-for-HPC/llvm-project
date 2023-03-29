@@ -40,6 +40,9 @@ static const DenseMap<StringRef, Directive> StringToDir = {
     {"DIR.OMP.TARGET", OMPD_target},
     {"DIR.OMP.TEAMS", OMPD_teams},
     {"DIR.OMP.TARGET.TEAMS", OMPD_target_teams},
+    {"DIR.OMP.TARGET.ENTER.DATA", OMPD_target_enter_data},
+    {"DIR.OMP.TARGET.EXIT.DATA", OMPD_target_exit_data},
+    {"DIR.OMP.TARGET.TEAMS.DISTRIBUTE", OMPD_target_teams_distribute}
     };
 
 // TODO: add more reduction operators.
@@ -172,12 +175,11 @@ public:
   void emitOMPOffloadingEntry(const Twine &DevFuncName, Value *EntryPtr,
                               Constant *&OMPOffloadEntry);
 
-  void
-  emitOMPOffloadingMappings(InsertPointTy AllocaIP,
-                            MapVector<Value *, DSAType> &DSAValueMap,
-                            MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
-                                &StructMappingInfoMap,
-                            OffloadingMappingArgsTy &OffloadingMappingArgs);
+  void emitOMPOffloadingMappings(
+      InsertPointTy AllocaIP, MapVector<Value *, DSAType> &DSAValueMap,
+      MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
+          &StructMappingInfoMap,
+      OffloadingMappingArgsTy &OffloadingMappingArgs, bool IsTargetRegion);
 
   void emitOMPSingle(Function *Fn, BasicBlock *BBEntry, BasicBlock *AfterBB,
                      BodyGenCallbackTy BodyGenCB, FinalizeCallbackTy FiniCB);
@@ -209,6 +211,22 @@ public:
                           const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry,
                           BasicBlock *StartBB, BasicBlock *EndBB,
                           BasicBlock *AfterBB);
+
+  void
+  emitOMPTargetEnterData(Function *Fn, BasicBlock *BBEntry,
+                         MapVector<Value *, DSAType> &DSAValueMap,
+                         MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
+                             &StructMappingInfoMap);
+
+  void
+  emitOMPTargetExitData(Function *Fn, BasicBlock *BBEntry,
+                         MapVector<Value *, DSAType> &DSAValueMap,
+                         MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
+                             &StructMappingInfoMap);
+
+  void emitOMPDistribute(MapVector<Value *, DSAType> &DSAValueMap, Value *IV,
+                         Value *UB, BasicBlock *PreHeader, BasicBlock *Exit,
+                         OMPScheduleType Sched, Value *Chunk);
 
   GlobalVariable *emitOffloadingGlobals(StringRef DevWrapperFuncName,
                                         ConstantDataArray *ELF);

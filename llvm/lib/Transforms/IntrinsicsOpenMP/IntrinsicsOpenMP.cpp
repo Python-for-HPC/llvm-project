@@ -177,6 +177,7 @@ struct IntrinsicsOpenMP : public ModulePass {
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
               case OMPD_target_teams:
+              case OMPD_target_teams_distribute:
                 TargetInfo.NumTeams = TagInputs[0];
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
@@ -193,6 +194,7 @@ struct IntrinsicsOpenMP : public ModulePass {
                 TeamsInfo.ThreadLimit = TagInputs[0];
                 break;
               case OMPD_target_teams:
+              case OMPD_target_teams_distribute:
                 TargetInfo.ThreadLimit = TagInputs[0];
                 TeamsInfo.ThreadLimit = TagInputs[0];
                 break;
@@ -358,6 +360,59 @@ struct IntrinsicsOpenMP : public ModulePass {
                                     EndBB, AfterBB);
         }
         else {
+          CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
+                              AfterBB, TeamsInfo.NumTeams,
+                              TeamsInfo.ThreadLimit);
+          StartBB = SplitBlock(BBEntry, &*BBEntry->getFirstInsertionPt());
+          EndBB = AfterBB;
+          CGIOMP.emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn,
+                               BBEntry, StartBB, EndBB, DSAValueMap,
+                               StructMappingInfoMap, TargetInfo.NumTeams,
+                               TargetInfo.ThreadLimit);
+        }
+      } else if (Dir == OMPD_target_enter_data) {
+        if (IsDeviceTargetRegion)
+          report_fatal_error("Target enter data should never appear inside a "
+                             "device target region");
+
+        CGIOMP.emitOMPTargetEnterData(Fn, BBEntry, DSAValueMap,
+                                      StructMappingInfoMap);
+      } else if (Dir == OMPD_target_exit_data) {
+        if (IsDeviceTargetRegion)
+          report_fatal_error("Target exit data should never appear inside a "
+                             "device target region");
+
+        CGIOMP.emitOMPTargetExitData(Fn, BBEntry, DSAValueMap,
+                                      StructMappingInfoMap);
+      } else if (Dir == OMPD_target_teams_distribute) {
+        report_fatal_error("OpenMP distribute is not supported yet.");
+        // Lower distribute
+        LLVM_DEBUG(dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n");
+        LLVM_DEBUG(dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n");
+        assert(OMPLoopInfo.IV && "Expected non-null IV");
+        assert(OMPLoopInfo.UB && "Expected non-null UB");
+
+        BasicBlock *PreHeader = StartBB;
+        BasicBlock *Header = PreHeader->getUniqueSuccessor();
+        BasicBlock *Exit = BBExit;
+        assert(Header && "Expected unique successor from PreHeader to Header");
+        LLVM_DEBUG(dbgs() << "=== PreHeader\n"
+                          << *PreHeader << "=== End of PreHeader\n");
+        LLVM_DEBUG(dbgs() << "=== Header\n"
+                          << *Header << "=== End of Header\n");
+        LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
+
+        // TODO: Support more distribute schedule types.
+        CGIOMP.emitOMPDistribute(DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB,
+                                 PreHeader, Exit, OMPScheduleType::Distribute,
+                                 OMPLoopInfo.Chunk);
+
+        // Lower target_teams.
+        if (IsDeviceTargetRegion) {
+          CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
+          CGIOMP.emitOMPTeamsDevice(DSAValueMap, DL, Fn, BBEntry, StartBB,
+                                    EndBB, AfterBB);
+        } else {
           CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
                               AfterBB, TeamsInfo.NumTeams,
                               TeamsInfo.ThreadLimit);
