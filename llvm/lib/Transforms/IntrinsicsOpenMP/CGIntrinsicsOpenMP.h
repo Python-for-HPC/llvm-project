@@ -226,7 +226,8 @@ public:
 
   void emitOMPDistribute(MapVector<Value *, DSAType> &DSAValueMap, Value *IV,
                          Value *UB, BasicBlock *PreHeader, BasicBlock *Exit,
-                         OMPScheduleType Sched, Value *Chunk);
+                         OMPScheduleType Sched, Value *Chunk,
+                         bool IsStandalone);
 
   GlobalVariable *emitOffloadingGlobals(StringRef DevWrapperFuncName,
                                         ConstantDataArray *ELF);

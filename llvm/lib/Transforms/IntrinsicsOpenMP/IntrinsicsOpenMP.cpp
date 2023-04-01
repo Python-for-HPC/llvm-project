@@ -329,9 +329,14 @@ struct IntrinsicsOpenMP : public ModulePass {
         CGIOMP.emitOMPFor(DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB,
                           PreHeader, Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk,
                           /* IsStandalone */ false);
-        CGIOMP.emitOMPParallel(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                               AfterBB, FiniCB, ParRegionInfo.IfCondition,
-                               ParRegionInfo.NumThreads);
+        if (IsOpenMPDeviceRuntime())
+          CGIOMP.emitOMPParallelDevice(
+              DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB, AfterBB, FiniCB,
+              ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
+        else
+          CGIOMP.emitOMPParallel(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
+                                 AfterBB, FiniCB, ParRegionInfo.IfCondition,
+                                 ParRegionInfo.NumThreads);
       } else if (Dir == OMPD_task) {
         CGIOMP.emitOMPTask(DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB);
       } else if (Dir == OMPD_taskwait) {
@@ -385,7 +390,6 @@ struct IntrinsicsOpenMP : public ModulePass {
         CGIOMP.emitOMPTargetExitData(Fn, BBEntry, DSAValueMap,
                                       StructMappingInfoMap);
       } else if (Dir == OMPD_target_teams_distribute) {
-        report_fatal_error("OpenMP distribute is not supported yet.");
         // Lower distribute
         LLVM_DEBUG(dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n");
         LLVM_DEBUG(dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n");
@@ -405,13 +409,13 @@ struct IntrinsicsOpenMP : public ModulePass {
         // TODO: Support more distribute schedule types.
         CGIOMP.emitOMPDistribute(DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB,
                                  PreHeader, Exit, OMPScheduleType::Distribute,
-                                 OMPLoopInfo.Chunk);
+                                 OMPLoopInfo.Chunk, /* IsStandalone */ false);
 
         // Lower target_teams.
         if (IsDeviceTargetRegion) {
-          CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
           CGIOMP.emitOMPTeamsDevice(DSAValueMap, DL, Fn, BBEntry, StartBB,
                                     EndBB, AfterBB);
+          CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
         } else {
           CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
                               AfterBB, TeamsInfo.NumTeams,

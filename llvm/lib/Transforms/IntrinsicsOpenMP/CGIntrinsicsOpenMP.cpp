@@ -85,25 +85,27 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
       Function::Create(OutlinedFnTy, GlobalValue::InternalLinkage,
                        OuterFn->getName() + Suffix, M);
 
-  // Name the parameters.
+  // Name the parameters and add attributes. Shared are ordered before
+  // firstprivate in the parameter list.
   OutlinedFn->arg_begin()->setName("global_tid");
   std::next(OutlinedFn->arg_begin())->setName("bound_tid");
   Function::arg_iterator AI = std::next(OutlinedFn->arg_begin(), 2);
-  int num_arg = 2;
+  int arg_no = 2;
   for (auto *V : CapturedShared) {
     AI->setName(V->getName() + ".shared");
-    OutlinedFn->addParamAttr(num_arg, Attribute::NonNull);
+    OutlinedFn->addParamAttr(arg_no, Attribute::NonNull);
     OutlinedFn->addParamAttr(
-        num_arg, Attribute::get(M.getContext(), Attribute::Dereferenceable, 8));
+        arg_no, Attribute::get(M.getContext(), Attribute::Dereferenceable, 8));
     ++AI;
-    ++num_arg;
+    ++arg_no;
   }
   for (auto *V : CapturedFirstprivate) {
     AI->setName(V->getName() + ".firstprivate");
-    OutlinedFn->addParamAttr(num_arg, Attribute::NonNull);
+    OutlinedFn->addParamAttr(arg_no, Attribute::NonNull);
     OutlinedFn->addParamAttr(
-        num_arg, Attribute::get(M.getContext(), Attribute::Dereferenceable, 8));
+        arg_no, Attribute::get(M.getContext(), Attribute::Dereferenceable, 8));
     ++AI;
+    ++arg_no;
   }
 
   BasicBlock *OutlinedEntryBB =
@@ -394,7 +396,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelDevice(
   AllocaInst *TIDAddr =
       OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, ".tid.addr");
   AllocaInst *ZeroAddr =
-      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, "zero.addr");
+      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, ".zero.addr");
   AllocaInst *GlobalArgs = OMPBuilder.Builder.CreateAlloca(
       OMPBuilder.Int8PtrPtr, nullptr, "global_args");
 
@@ -542,10 +544,10 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
   Type *I32Type = Type::getInt32Ty(M.getContext());
   OMPBuilder.Builder.restoreIP(AllocaIP);
   Value *PLastIter =
-      OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, "omp_lastiter");
-  Value *PLowerBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_lb");
-  Value *PStride = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_stride");
-  Value *PUpperBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_ub");
+      OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, ".omp.for.is_last");
+  Value *PLowerBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.lb");
+  Value *PStride = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, ".omp.for.stride");
+  Value *PUpperBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, ".omp.for.ub");
 
   OpenMPIRBuilder::OutlineInfo OI;
   OI.EntryBB = PreHeader;
@@ -554,9 +556,8 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
   SmallVector<BasicBlock *, 8> BlockVector;
   OI.collectBlocks(BlockSet, BlockVector);
 
-  // Do privatization if standalone.
-  // TODO: create PrivCBHelper and re-use PrivCB from emitOMPParallel.
-  if (IsStandalone)
+  // TODO: De-duplicate privatization code.
+  auto Privatizer = [&]() {
     for (auto &It : DSAValueMap) {
       Value *Orig = It.first;
       DSAType DSA = It.second;
@@ -615,6 +616,7 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
       for (Use *UPtr : Uses)
         UPtr->set(ReplacementValue);
     }
+  };
 
   OMPBuilder.Builder.SetInsertPoint(PreHeader->getTerminator());
 
@@ -665,7 +667,7 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
   OMPBuilder.Builder.SetInsertPoint(FiniBB, FiniBB->getFirstInsertionPt());
   OMPBuilder.Builder.CreateCall(KmpcForStaticFini, {SrcLoc, ThreadNum});
 
-  // Emit reductions, barrier if standalone.
+  // Emit reductions, barrier, privatize if standalone.
   if (IsStandalone) {
     if (!ReductionInfos.empty())
       OMPBuilder.createReductions(OMPBuilder.Builder.saveIP(), AllocaIP,
@@ -677,6 +679,7 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
                              omp::Directive::OMPD_for,
                              /* ForceSimpleCall */ false,
                              /* CheckCancelFlag */ false);
+    Privatizer();
   }
 }
 
@@ -1076,11 +1079,19 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
     case DSA_MAP_TO:
     case DSA_MAP_FROM:
     case DSA_MAP_TOFROM:
-    case DSA_FIRSTPRIVATE:
       Size = ConstantInt::get(OMPBuilder.SizeTy,
                               M.getDataLayout().getTypeAllocSize(V->getType()));
       EmitMappingEntry(Size, GetMapType(DSA), V, V);
       break;
+    case DSA_FIRSTPRIVATE: {
+      auto *ScalarV = OMPBuilder.Builder.CreateLoad(
+          V->getType()->getPointerElementType(), V);
+      Size = ConstantInt::get(OMPBuilder.SizeTy,
+                              M.getDataLayout().getTypeAllocSize(
+                                  V->getType()->getPointerElementType()));
+      EmitMappingEntry(Size, GetMapType(DSA), ScalarV, ScalarV);
+      break;
+    }
     case DSA_MAP_STRUCT: {
       Size = ConstantInt::get(OMPBuilder.SizeTy,
                               M.getDataLayout().getTypeAllocSize(
@@ -1624,7 +1635,7 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDevice(
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn =
       createOutlinedFunction(DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB,
-                             CapturedVars, ".omp_outlined_team");
+                             CapturedVars, ".omp_outlined_teams");
 
   // Set up the call to the teams outlined function.
   BBEntry->getTerminator()->eraseFromParent();
@@ -1643,9 +1654,9 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDevice(
 
   // Create global_tid, bound_tid (zero) to pass to the teams outlined function.
   AllocaInst *ThreadIDAddr =
-      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, "threadid.addr");
+      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, ".threadid.addr");
   AllocaInst *ZeroAddr =
-      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, "zero.addr");
+      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, ".zero.addr");
   OMPBuilder.Builder.CreateStore(ThreadID, ThreadIDAddr);
   OMPBuilder.Builder.CreateStore(Constant::getNullValue(OMPBuilder.Int32),
                                  ZeroAddr);
@@ -1673,7 +1684,7 @@ void CGIntrinsicsOpenMP::emitOMPTeams(MapVector<Value *, DSAType> &DSAValueMap,
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn =
       createOutlinedFunction(DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB,
-                             CapturedVars, ".omp_outlined_team");
+                             CapturedVars, ".omp_outlined_teams");
 
   // Set up the call to the teams outlined function.
   BBEntry->getTerminator()->eraseFromParent();
@@ -1789,7 +1800,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetExitData(
 void CGIntrinsicsOpenMP::emitOMPDistribute(MapVector<Value *, DSAType> &DSAValueMap,
                                     Value *IV, Value *UB, BasicBlock *PreHeader,
                                     BasicBlock *Exit, OMPScheduleType Sched,
-                                    Value *Chunk) {
+                                    Value *Chunk, bool IsStandalone) {
   Type *IVTy = IV->getType()->getPointerElementType();
 
   auto GetKmpcForStaticInit = [&]() -> FunctionCallee {
@@ -1820,10 +1831,10 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(MapVector<Value *, DSAType> &DSAValue
   Type *I32Type = Type::getInt32Ty(M.getContext());
   OMPBuilder.Builder.restoreIP(AllocaIP);
   Value *PLastIter =
-      OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, "omp_lastiter");
-  Value *PLowerBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_lb");
-  Value *PStride = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_stride");
-  Value *PUpperBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp_ub");
+      OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, ".omp.distribute.is_last");
+  Value *PLowerBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, ".omp.distribute.lb");
+  Value *PStride = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, ".omp.distribute.stride");
+  Value *PUpperBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, ".omp.distribute.ub");
 
   OpenMPIRBuilder::OutlineInfo OI;
   OI.EntryBB = PreHeader;
@@ -1832,47 +1843,48 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(MapVector<Value *, DSAType> &DSAValue
   SmallVector<BasicBlock *, 8> BlockVector;
   OI.collectBlocks(BlockSet, BlockVector);
 
-  // Do privatization.
-  // TODO: create PrivCBHelper and re-use PrivCB from emitOMPParallel.
-  for (auto &It : DSAValueMap) {
-    Value *Orig = It.first;
-    DSAType DSA = It.second;
-    Value *ReplacementValue = nullptr;
-    Type *VTy = Orig->getType()->getPointerElementType();
+  // TODO: De-duplicate privatization code.
+  auto Privatizer = [&]() {
+    for (auto &It : DSAValueMap) {
+      Value *Orig = It.first;
+      DSAType DSA = It.second;
+      Value *ReplacementValue = nullptr;
+      Type *VTy = Orig->getType()->getPointerElementType();
 
-    if (DSA == DSA_SHARED)
-      continue;
+      if (DSA == DSA_SHARED)
+        continue;
 
-    // Store previous uses to set them to the ReplacementValue after
-    // privatization codegen.
-    SetVector<Use *> Uses;
-    for (Use &U : Orig->uses())
-      if (auto *UserI = dyn_cast<Instruction>(U.getUser()))
-        if (BlockSet.count(UserI->getParent()))
-          Uses.insert(&U);
+      // Store previous uses to set them to the ReplacementValue after
+      // privatization codegen.
+      SetVector<Use *> Uses;
+      for (Use &U : Orig->uses())
+        if (auto *UserI = dyn_cast<Instruction>(U.getUser()))
+          if (BlockSet.count(UserI->getParent()))
+            Uses.insert(&U);
 
-    OMPBuilder.Builder.restoreIP(AllocaIP);
-    if (DSA == DSA_PRIVATE) {
-      ReplacementValue = OMPBuilder.Builder.CreateAlloca(
-          VTy, /*ArraySize */ nullptr, Orig->getName() + ".distribute.priv");
-      OMPBuilder.Builder.CreateStore(Constant::getNullValue(VTy),
-                                     ReplacementValue);
-    } else if (DSA == DSA_FIRSTPRIVATE) {
-      Value *V = OMPBuilder.Builder.CreateLoad(
-          VTy, Orig, Orig->getName() + ".distribute.firstpriv.reload");
-      ReplacementValue = OMPBuilder.Builder.CreateAlloca(
-          VTy, /*ArraySize */ nullptr,
-          Orig->getName() + ".distribute.firstpriv.copy");
-      OMPBuilder.Builder.CreateStore(V, ReplacementValue);
-      // ReplacementValue = Orig;
-    } else
-      assert(false && "Unsupported privatization");
+      OMPBuilder.Builder.restoreIP(AllocaIP);
+      if (DSA == DSA_PRIVATE) {
+        ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+            VTy, /*ArraySize */ nullptr, Orig->getName() + ".distribute.priv");
+        OMPBuilder.Builder.CreateStore(Constant::getNullValue(VTy),
+                                       ReplacementValue);
+      } else if (DSA == DSA_FIRSTPRIVATE) {
+        Value *V = OMPBuilder.Builder.CreateLoad(
+            VTy, Orig, Orig->getName() + ".distribute.firstpriv.reload");
+        ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+            VTy, /*ArraySize */ nullptr,
+            Orig->getName() + ".distribute.firstpriv.copy");
+        OMPBuilder.Builder.CreateStore(V, ReplacementValue);
+        // ReplacementValue = Orig;
+      } else
+        assert(false && "Unsupported privatization");
 
-    assert(ReplacementValue && "Expected non-null ReplacementValue");
+      assert(ReplacementValue && "Expected non-null ReplacementValue");
 
-    for (Use *UPtr : Uses)
-      UPtr->set(ReplacementValue);
-  }
+      for (Use *UPtr : Uses)
+        UPtr->set(ReplacementValue);
+    }
+  };
 
   OMPBuilder.Builder.SetInsertPoint(PreHeader->getTerminator());
 
@@ -1921,4 +1933,8 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(MapVector<Value *, DSAType> &DSAValue
   BasicBlock *FiniBB = SplitBlock(Exit, &*Exit->getFirstInsertionPt());
   OMPBuilder.Builder.SetInsertPoint(FiniBB, FiniBB->getFirstInsertionPt());
   OMPBuilder.Builder.CreateCall(KmpcForStaticFini, {SrcLoc, ThreadNum});
+
+  // Run the privatizer last to update values in the whole generated code.
+  if (IsStandalone)
+    Privatizer();
 }
