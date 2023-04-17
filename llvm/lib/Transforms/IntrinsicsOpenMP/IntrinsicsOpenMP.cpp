@@ -19,6 +19,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
@@ -43,6 +44,13 @@ struct IntrinsicsOpenMP : public ModulePass {
   IntrinsicsOpenMP() : ModulePass(ID) {}
 
   bool runOnModule(Module &M) override {
+    // NOTE: Codegen for nested or combined constructs assumes code is generated
+    // bottom-up, that is from the innermost directive to the outermost. This
+    // simplifies handling of DSA attributes by avoiding renaming values when an
+    // outlined function privatizes them in the DSAValueMap. For combined
+    // constructs, codegen enforces the innermost-to-outermost order. For nested
+    // constructs, the assumption is that LLVM IR traversal for region tags
+    // follows that order.
     LLVM_DEBUG(dbgs() << "=== Start IntrinsicsOpenMPPass v4\n");
 
     Function *RegionEntryF = M.getFunction("llvm.directive.region.entry");
@@ -70,43 +78,14 @@ struct IntrinsicsOpenMP : public ModulePass {
       SmallVector<OperandBundleDef, 16> OpBundles;
       MapVector<Value *, DSAType> DSAValueMap;
 
-      struct {
-        Value *IV = nullptr;
-        Value *UB = nullptr;
-        // Implementation defined: set default schedule to static.
-        OMPScheduleType Sched = OMPScheduleType::Static;
-        Value *Chunk = nullptr;
-      } OMPLoopInfo;
-
-      struct {
-        Value *NumThreads = nullptr;
-        Value *IfCondition = nullptr;
-      } ParRegionInfo;
-
-      struct {
-        StringRef DevFuncName;
-        ConstantDataArray *ELF;
-        Value *NumTeams = nullptr;
-        Value *ThreadLimit = nullptr;
-      } TargetInfo;
-
-      struct {
-        Value *NumTeams = nullptr;
-        Value *ThreadLimit = nullptr;
-      } TeamsInfo;
+      OMPLoopInfoStruct OMPLoopInfo;
+      ParRegionInfoStruct ParRegionInfo;
+      TargetInfoStruct TargetInfo;
+      TeamsInfoStruct TeamsInfo;
 
       MapVector<Value *, SmallVector<FieldMappingInfo, 4>> StructMappingInfoMap;
 
       bool IsDeviceTargetRegion = false;
-
-      auto IsOpenMPDeviceRuntime = [&M]() {
-        Triple TargetTriple(M.getTargetTriple());
-
-        if (TargetTriple.isNVPTX())
-          return true;
-
-        return false;
-      };
 
       CBEntry->getOperandBundlesAsDefs(OpBundles);
       // TODO: parse clauses.
@@ -125,6 +104,12 @@ struct IntrinsicsOpenMP : public ModulePass {
           if (Tag.startswith("QUAL.OMP.NORMALIZED.IV")) {
             assert(O.input_size() == 1 && "Expected single IV value");
             OMPLoopInfo.IV = TagInputs[0];
+          } else if (Tag.startswith("QUAL.OMP.NORMALIZED.START")) {
+            assert(O.input_size() == 1 && "Expected single START value");
+            OMPLoopInfo.Start = TagInputs[0];
+          } else if (Tag.startswith("QUAL.OMP.NORMALIZED.LB")) {
+            assert(O.input_size() == 1 && "Expected single LB value");
+            OMPLoopInfo.LB = TagInputs[0];
           } else if (Tag.startswith("QUAL.OMP.NORMALIZED.UB")) {
             assert(O.input_size() == 1 && "Expected single UB value");
             OMPLoopInfo.UB = TagInputs[0];
@@ -132,6 +117,7 @@ struct IntrinsicsOpenMP : public ModulePass {
             assert(O.input_size() == 1 && "Expected single NumThreads value");
             ParRegionInfo.NumThreads = TagInputs[0];
           } else if (Tag.startswith("QUAL.OMP.SCHEDULE")) {
+            // TODO: Add DIST_SCHEDULE for distribute loops.
             assert(O.input_size() == 1 &&
                    "Expected single chunking scheduling value");
             Constant *Zero = ConstantInt::get(TagInputs[0]->getType(), 0);
@@ -178,11 +164,13 @@ struct IntrinsicsOpenMP : public ModulePass {
                 break;
               case OMPD_target_teams:
               case OMPD_target_teams_distribute:
+              case OMPD_target_teams_distribute_parallel_for:
                 TargetInfo.NumTeams = TagInputs[0];
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
               default:
-                report_fatal_error("Unsupported qualifier in directive");
+                //report_fatal_error("Unsupported qualifier in directive");
+                assert(false && "Unsupported qualifier in directive");
             }
           } else if (Tag.startswith("QUAL.OMP.THREAD_LIMIT")) {
             assert(O.input_size() == 1 && "Expected single ThreadLimit value");
@@ -195,11 +183,13 @@ struct IntrinsicsOpenMP : public ModulePass {
                 break;
               case OMPD_target_teams:
               case OMPD_target_teams_distribute:
+              case OMPD_target_teams_distribute_parallel_for:
                 TargetInfo.ThreadLimit = TagInputs[0];
                 TeamsInfo.ThreadLimit = TagInputs[0];
                 break;
               default:
-                report_fatal_error("Unsupported qualifier in directive");
+                //report_fatal_error("Unsupported qualifier in directive");
+                assert(false && "Unsupported qualifier in directive");
             }
           } else /* DSA Qualifiers */ {
             auto It = StringToDSA.find(Tag);
@@ -273,14 +263,8 @@ struct IntrinsicsOpenMP : public ModulePass {
       CGIntrinsicsOpenMP CGIOMP(M);
 
       if (Dir == OMPD_parallel) {
-        if (IsOpenMPDeviceRuntime())
-          CGIOMP.emitOMPParallelDevice(
-              DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB, AfterBB, FiniCB,
-              ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
-        else
-          CGIOMP.emitOMPParallel(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                                 AfterBB, FiniCB, ParRegionInfo.IfCondition,
-                                 ParRegionInfo.NumThreads);
+        CGIOMP.emitOMPParallel(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
+                               EndBB, AfterBB, FiniCB, ParRegionInfo);
       } else if (Dir == OMPD_single) {
         CGIOMP.emitOMPSingle(Fn, BBEntry, AfterBB, BodyGenCB, FiniCB);
       } else if (Dir == OMPD_critical) {
@@ -288,93 +272,29 @@ struct IntrinsicsOpenMP : public ModulePass {
       } else if (Dir == OMPD_barrier) {
         CGIOMP.emitOMPBarrier(Fn, BBEntry, OMPD_barrier);
       } else if (Dir == OMPD_for) {
-        LLVM_DEBUG(dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n");
-        LLVM_DEBUG(dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n");
-        assert(OMPLoopInfo.IV && "Expected non-null IV");
-        assert(OMPLoopInfo.UB && "Expected non-null UB");
-
-        BasicBlock *PreHeader = StartBB;
-        BasicBlock *Header = PreHeader->getUniqueSuccessor();
-        BasicBlock *Exit = BBExit;
-        assert(Header && "Expected unique successor from PreHeader to Header");
-        LLVM_DEBUG(dbgs() << "=== PreHeader\n"
-                          << *PreHeader << "=== End of PreHeader\n");
-        LLVM_DEBUG(dbgs() << "=== Header\n"
-                          << *Header << "=== End of Header\n");
-        LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
-
-        CGIOMP.emitOMPFor(DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB,
-                          PreHeader, Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk,
+        CGIOMP.emitOMPFor(DSAValueMap, OMPLoopInfo, StartBB, BBExit,
                           /* IsStandalone */ true);
         LLVM_DEBUG(dbgs() << "=== For Fn\n" << *Fn << "=== End of For Fn\n");
       } else if (Dir == OMPD_parallel_for) {
-        // TODO: Verify the DSA for IV, UB since they are implicit in the
-        // combined directive entry.
-        assert(OMPLoopInfo.IV && "Expected non-null IV");
-        assert(OMPLoopInfo.UB && "Expected non-null UB");
-
-        // TODO: Check setting DSA for IV, UB for correctness.
-        DSAValueMap[OMPLoopInfo.IV] = DSA_PRIVATE;
-        DSAValueMap[OMPLoopInfo.UB] = DSA_FIRSTPRIVATE;
-
-        BasicBlock *PreHeader = StartBB;
-        BasicBlock *Header = PreHeader->getUniqueSuccessor();
-        BasicBlock *Exit = BBExit;
-        assert(Header && "Expected unique successor from PreHeader to Header");
-        LLVM_DEBUG(dbgs() << "=== PreHeader\n"
-                          << *PreHeader << "=== End of PreHeader\n");
-        LLVM_DEBUG(dbgs() << "=== Header\n"
-                          << *Header << "=== End of Header\n");
-        LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
-        CGIOMP.emitOMPFor(DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB,
-                          PreHeader, Exit, OMPLoopInfo.Sched, OMPLoopInfo.Chunk,
+        CGIOMP.emitOMPFor(DSAValueMap, OMPLoopInfo, StartBB, BBExit,
                           /* IsStandalone */ false);
-        if (IsOpenMPDeviceRuntime())
-          CGIOMP.emitOMPParallelDevice(
-              DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB, AfterBB, FiniCB,
-              ParRegionInfo.IfCondition, ParRegionInfo.NumThreads);
-        else
-          CGIOMP.emitOMPParallel(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                                 AfterBB, FiniCB, ParRegionInfo.IfCondition,
-                                 ParRegionInfo.NumThreads);
+        CGIOMP.emitOMPParallel(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
+                               EndBB, AfterBB, FiniCB, ParRegionInfo);
       } else if (Dir == OMPD_task) {
         CGIOMP.emitOMPTask(DSAValueMap, Fn, BBEntry, StartBB, EndBB, AfterBB);
       } else if (Dir == OMPD_taskwait) {
         CGIOMP.emitOMPTaskwait(BBEntry);
       } else if (Dir == OMPD_target) {
-        if (IsDeviceTargetRegion)
-          CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
-        else
-          CGIOMP.emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn,
-                               BBEntry, StartBB, EndBB, DSAValueMap,
-                               StructMappingInfoMap, TargetInfo.NumTeams,
-                               TargetInfo.ThreadLimit);
-      }
-      else if (Dir == OMPD_teams) {
-        if (IsOpenMPDeviceRuntime())
-          CGIOMP.emitOMPTeamsDevice(DSAValueMap, DL, Fn, BBEntry, StartBB,
-                                    EndBB, AfterBB);
-        else
-          CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                              AfterBB, TeamsInfo.NumTeams,
-                              TeamsInfo.ThreadLimit);
+        CGIOMP.emitOMPTarget(Fn, BBEntry, StartBB, EndBB, DSAValueMap,
+                             StructMappingInfoMap, TargetInfo,
+                             IsDeviceTargetRegion);
+      } else if (Dir == OMPD_teams) {
+        CGIOMP.emitOMPTeams(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
+                            EndBB, AfterBB, TeamsInfo);
       } else if (Dir == OMPD_target_teams) {
-        if (IsDeviceTargetRegion) {
-          CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
-          CGIOMP.emitOMPTeamsDevice(DSAValueMap, DL, Fn, BBEntry, StartBB,
-                                    EndBB, AfterBB);
-        }
-        else {
-          CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                              AfterBB, TeamsInfo.NumTeams,
-                              TeamsInfo.ThreadLimit);
-          StartBB = SplitBlock(BBEntry, &*BBEntry->getFirstInsertionPt());
-          EndBB = AfterBB;
-          CGIOMP.emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn,
-                               BBEntry, StartBB, EndBB, DSAValueMap,
-                               StructMappingInfoMap, TargetInfo.NumTeams,
-                               TargetInfo.ThreadLimit);
-        }
+        CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
+                                  AfterBB, TargetInfo, StructMappingInfoMap,
+                                  IsDeviceTargetRegion);
       } else if (Dir == OMPD_target_enter_data) {
         if (IsDeviceTargetRegion)
           report_fatal_error("Target enter data should never appear inside a "
@@ -390,47 +310,27 @@ struct IntrinsicsOpenMP : public ModulePass {
         CGIOMP.emitOMPTargetExitData(Fn, BBEntry, DSAValueMap,
                                       StructMappingInfoMap);
       } else if (Dir == OMPD_target_teams_distribute) {
-        // Lower distribute
-        LLVM_DEBUG(dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n");
-        LLVM_DEBUG(dbgs() << "OMPLoopInfo.UB " << *OMPLoopInfo.UB << "\n");
-        assert(OMPLoopInfo.IV && "Expected non-null IV");
-        assert(OMPLoopInfo.UB && "Expected non-null UB");
-
-        BasicBlock *PreHeader = StartBB;
-        BasicBlock *Header = PreHeader->getUniqueSuccessor();
-        BasicBlock *Exit = BBExit;
-        assert(Header && "Expected unique successor from PreHeader to Header");
-        LLVM_DEBUG(dbgs() << "=== PreHeader\n"
-                          << *PreHeader << "=== End of PreHeader\n");
-        LLVM_DEBUG(dbgs() << "=== Header\n"
-                          << *Header << "=== End of Header\n");
-        LLVM_DEBUG(dbgs() << "=== Exit \n" << *Exit << "=== End of Exit\n");
-
-        // TODO: Support more distribute schedule types.
-        CGIOMP.emitOMPDistribute(DSAValueMap, OMPLoopInfo.IV, OMPLoopInfo.UB,
-                                 PreHeader, Exit, OMPScheduleType::Distribute,
-                                 OMPLoopInfo.Chunk, /* IsStandalone */ false);
-
-        // Lower target_teams.
-        if (IsDeviceTargetRegion) {
-          CGIOMP.emitOMPTeamsDevice(DSAValueMap, DL, Fn, BBEntry, StartBB,
-                                    EndBB, AfterBB);
-          CGIOMP.emitOMPTargetDevice(Fn, DSAValueMap);
-        } else {
-          CGIOMP.emitOMPTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                              AfterBB, TeamsInfo.NumTeams,
-                              TeamsInfo.ThreadLimit);
-          StartBB = SplitBlock(BBEntry, &*BBEntry->getFirstInsertionPt());
-          EndBB = AfterBB;
-          CGIOMP.emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn,
-                               BBEntry, StartBB, EndBB, DSAValueMap,
-                               StructMappingInfoMap, TargetInfo.NumTeams,
-                               TargetInfo.ThreadLimit);
-        }
+        CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
+                                 /* IsStandalone */ false);
+        CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
+                                  AfterBB, TargetInfo, StructMappingInfoMap,
+                                  IsDeviceTargetRegion);
+      } else if (Dir == OMPD_distribute_parallel_for) {
+        CGIOMP.emitOMPDistributeParallelFor(DSAValueMap, StartBB, BBExit,
+                                            OMPLoopInfo, ParRegionInfo,
+                                            /* isStandalone */ false);
+      } else if (Dir == OMPD_target_teams_distribute_parallel_for) {
+        CGIOMP.emitOMPTargetTeamsDistributeParallelFor(
+            DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB, BBExit, AfterBB,
+            OMPLoopInfo, ParRegionInfo, TargetInfo, StructMappingInfoMap,
+            IsDeviceTargetRegion);
       } else {
         LLVM_DEBUG(dbgs() << "Unknown directive " << *CBEntry << "\n");
         assert(false && "Unknown directive");
       }
+
+      if (verifyFunction(*Fn, &errs()))
+        report_fatal_error("Verification of IntrinsicsOpenMP lowering failed!");
     }
 
     LLVM_DEBUG(dbgs() << "=== Dump Lowered Module\n"
