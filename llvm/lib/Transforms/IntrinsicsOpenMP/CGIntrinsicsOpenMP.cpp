@@ -655,7 +655,8 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
   OI.collectBlocks(BlockSet, BlockVector);
 
   // TODO: De-duplicate privatization code.
-  auto Privatizer = [&]() {
+  auto PrivatizeWithReductions = [&]() {
+    auto CurrentIP = OMPBuilder.Builder.saveIP();
     for (auto &It : DSAValueMap) {
       Value *Orig = It.first;
       DSAType DSA = It.second;
@@ -700,8 +701,8 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
           OMPBuilder.Builder.CreateStore(ConstantFP::get(VTy, 0.0),
                                          ReplacementValue);
         else
-          assert(false &&
-                 "Unsupported type to init with idempotent reduction value");
+          report_fatal_error(
+              "Unsupported type to init with idempotent reduction value");
 
         ReductionInfos.push_back({Orig, ReplacementValue,
                                   CGReduction::sumReduction,
@@ -714,6 +715,8 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
       for (Use *UPtr : Uses)
         UPtr->set(ReplacementValue);
     }
+
+    OMPBuilder.Builder.restoreIP(CurrentIP);
   };
 
   OMPBuilder.Builder.SetInsertPoint(PreHeader->getTerminator());
@@ -769,6 +772,7 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
 
   // Emit reductions, barrier, privatize if standalone.
   if (IsStandalone) {
+    PrivatizeWithReductions();
     if (!ReductionInfos.empty())
       OMPBuilder.createReductions(OMPBuilder.Builder.saveIP(), AllocaIP,
                                   ReductionInfos);
@@ -779,7 +783,6 @@ void CGIntrinsicsOpenMP::emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
                              omp::Directive::OMPD_for,
                              /* ForceSimpleCall */ false,
                              /* CheckCancelFlag */ false);
-    Privatizer();
   }
 
   if (verifyFunction(*PreHeader->getParent(), &errs()))
