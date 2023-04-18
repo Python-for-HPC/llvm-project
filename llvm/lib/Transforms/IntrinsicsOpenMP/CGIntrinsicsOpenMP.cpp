@@ -1676,10 +1676,11 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
 
   for(auto &Arg : WrapperArgsNames)
     LLVM_DEBUG(dbgs() << "[IOMP] Adding wrapper arg " << Arg << "\n");
-  for(auto &Arg : WrapperArgsTypes)
+  for(auto &Arg : WrapperArgsTypes) {
     LLVM_DEBUG(dbgs() << "[IOMP] Arg type ");
     LLVM_DEBUG(Arg->print(dbgs()));
     LLVM_DEBUG(dbgs() << "\n");
+  }
 
   Twine DevWrapperFuncName = getDevWrapperFuncPrefix() + Fn->getName();
   FunctionType *NumbaWrapperFnTy =
