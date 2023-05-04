@@ -64,6 +64,7 @@ struct IntrinsicsOpenMP : public ModulePass {
     LLVM_DEBUG(dbgs() << "=== Dump Module\n"
                       << M << "=== End of Dump Module\n");
 
+    CGIntrinsicsOpenMP CGIOMP(M);
     // Iterate over all calls to directive intrinsics and transform code
     // using OpenMPIRBuilder for lowering.
     SmallVector<User *, 4> RegionEntryUsers(RegionEntryF->users());
@@ -259,8 +260,6 @@ struct IntrinsicsOpenMP : public ModulePass {
       // of CBEntry, then CBEntry.
       CBExit->eraseFromParent();
       CBEntry->eraseFromParent();
-
-      CGIntrinsicsOpenMP CGIOMP(M);
 
       if (Dir == OMPD_parallel) {
         CGIOMP.emitOMPParallel(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
