@@ -16,9 +16,10 @@ using FinalizeCallbackTy = OpenMPIRBuilder::FinalizeCallbackTy;
 namespace iomp {
 // TODO: expose clauses through namespace omp?
 enum DSAType {
+  DSA_NONE,
   DSA_PRIVATE,
   DSA_FIRSTPRIVATE,
-  DSA_FIRSTPRIVATE_BYVAL,
+  DSA_LASTPRIVATE,
   DSA_SHARED,
   DSA_REDUCTION_ADD,
   DSA_MAP_TO,
@@ -29,6 +30,23 @@ enum DSAType {
   DSA_MAP_TOFROM_STRUCT,
   DSA_MAP_STRUCT
 };
+
+struct DSATypeInfo {
+  DSAType Type;
+  FunctionCallee CopyConstructor;
+
+  DSATypeInfo() : Type(DSA_NONE), CopyConstructor(nullptr) {}
+  DSATypeInfo(DSAType InType) : Type(InType), CopyConstructor(nullptr) {}
+  DSATypeInfo(DSAType InType, FunctionCallee InCopyConstructor)
+      : Type(InType), CopyConstructor(InCopyConstructor) {}
+  DSATypeInfo(const DSATypeInfo &DTI) {
+    Type = DTI.Type;
+    CopyConstructor = DTI.CopyConstructor;
+  }
+};
+
+using DSAValueMapTy = MapVector<Value *, DSATypeInfo>;
+//using DSAValueMapTy = MapVector<Value *, DSAType>;
 
 static const DenseMap<StringRef, Directive> StringToDir = {
     {"DIR.OMP.PARALLEL", OMPD_parallel},
@@ -41,6 +59,7 @@ static const DenseMap<StringRef, Directive> StringToDir = {
     {"DIR.OMP.TASKWAIT", OMPD_taskwait},
     {"DIR.OMP.TARGET", OMPD_target},
     {"DIR.OMP.TEAMS", OMPD_teams},
+    {"DIR.OMP.DISTRIBUTE", OMPD_distribute},
     {"DIR.OMP.TARGET.TEAMS", OMPD_target_teams},
     {"DIR.OMP.TARGET.ENTER.DATA", OMPD_target_enter_data},
     {"DIR.OMP.TARGET.EXIT.DATA", OMPD_target_exit_data},
@@ -53,6 +72,7 @@ static const DenseMap<StringRef, Directive> StringToDir = {
 static const DenseMap<StringRef, DSAType> StringToDSA = {
     {"QUAL.OMP.PRIVATE", DSA_PRIVATE},
     {"QUAL.OMP.FIRSTPRIVATE", DSA_FIRSTPRIVATE},
+    {"QUAL.OMP.LASTPRIVATE", DSA_LASTPRIVATE},
     {"QUAL.OMP.SHARED", DSA_SHARED},
     {"QUAL.OMP.REDUCTION.ADD", DSA_REDUCTION_ADD},
     {"QUAL.OMP.MAP.TO", DSA_MAP_TO},
@@ -183,18 +203,18 @@ public:
 
   StructType *getTgtOffloadEntryTy() { return TgtOffloadEntryTy; }
 
-  void emitOMPParallel(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPParallel(DSAValueMapTy &DSAValueMap,
                        ValueToValueMapTy *VMap, const DebugLoc &DL,
                        Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
                        BasicBlock *EndBB, BasicBlock *AfterBB,
                        FinalizeCallbackTy FiniCB,
                        ParRegionInfoStruct &ParRegionInfo);
 
-  void emitOMPFor(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPFor(DSAValueMapTy &DSAValueMap,
                   OMPLoopInfoStruct &OMPLoopInfo, BasicBlock *StartBB,
                   BasicBlock *ExitBB, bool IsStandalone);
 
-  void emitOMPTask(MapVector<Value *, DSAType> &DSAValueMap, Function *Fn,
+  void emitOMPTask(DSAValueMapTy &DSAValueMap, Function *Fn,
                    BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
                    BasicBlock *AfterBB);
 
@@ -202,7 +222,7 @@ public:
                               Constant *&OMPOffloadEntry);
 
   void emitOMPOffloadingMappings(
-      InsertPointTy AllocaIP, MapVector<Value *, DSAType> &DSAValueMap,
+      InsertPointTy AllocaIP, DSAValueMapTy &DSAValueMap,
       MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
           &StructMappingInfoMap,
       OffloadingMappingArgsTy &OffloadingMappingArgs, bool IsTargetRegion);
@@ -219,40 +239,40 @@ public:
 
   void emitOMPTarget(Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
                      BasicBlock *EndBB,
-                     MapVector<Value *, DSAType> &DSAValueMap,
+                     DSAValueMapTy &DSAValueMap,
                      MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                          &StructMappingInfoMap,
                      TargetInfoStruct &TargetInfo, bool IsDeviceTargetRegion);
 
-  void emitOMPTeams(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPTeams(DSAValueMapTy &DSAValueMap,
                     ValueToValueMapTy *VMap, const DebugLoc &DL, Function *Fn,
                     BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
                     BasicBlock *AfterBB, TeamsInfoStruct &TeamsInfo);
 
   void
   emitOMPTargetEnterData(Function *Fn, BasicBlock *BBEntry,
-                         MapVector<Value *, DSAType> &DSAValueMap,
+                         DSAValueMapTy &DSAValueMap,
                          MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                              &StructMappingInfoMap);
 
   void
   emitOMPTargetExitData(Function *Fn, BasicBlock *BBEntry,
-                         MapVector<Value *, DSAType> &DSAValueMap,
+                         DSAValueMapTy &DSAValueMap,
                          MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                              &StructMappingInfoMap);
 
-  void emitOMPDistribute(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPDistribute(DSAValueMapTy &DSAValueMap,
                          BasicBlock *StartBB, BasicBlock *ExitBB,
                          OMPLoopInfoStruct &OMPLoopInfo, bool IsStandalone);
 
-  void emitOMPDistributeParallelFor(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPDistributeParallelFor(DSAValueMapTy &DSAValueMap,
                                     BasicBlock *StartBB, BasicBlock *ExitBB,
                                     OMPLoopInfoStruct &OMPLoopInfo,
                                     ParRegionInfoStruct &ParRegionInfo,
                                     bool IsStandalone);
 
   void emitOMPTargetTeamsDistributeParallelFor(
-      MapVector<Value *, DSAType> &DSAValueMap, const DebugLoc &DL,
+      DSAValueMapTy &DSAValueMap, const DebugLoc &DL,
       Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
       BasicBlock *ExitBB, BasicBlock *AfterBB, OMPLoopInfoStruct &OMPLoopInfo,
       ParRegionInfoStruct &ParRegionInfo, TargetInfoStruct &TargetInfo,
@@ -260,7 +280,7 @@ public:
           &StructMappingInfoMap,
       bool IsDeviceTargetRegion);
 
-  void emitOMPTargetTeams(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPTargetTeams(DSAValueMapTy &DSAValueMap,
                           const DebugLoc &DL, Function *Fn, BasicBlock *EntryBB,
                           BasicBlock *StartBB, BasicBlock *EndBB,
                           BasicBlock *AfterBB,
@@ -274,7 +294,7 @@ public:
 
   Twine getDevWrapperFuncPrefix() { return "__omp_offload_numba_"; }
 
-  Function *createOutlinedFunction(MapVector<Value *, DSAType> &DSAValueMap,
+  Function *createOutlinedFunction(DSAValueMapTy &DSAValueMap,
                                    ValueToValueMapTy *VMap,
                                    Function * OuterFn, BasicBlock *BBEntry,
                                    BasicBlock *StartBB, BasicBlock *EndBB,
@@ -283,14 +303,14 @@ public:
                                    StringRef Suffix);
 
 private:
-  void emitOMPParallelDeviceRuntime(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPParallelDeviceRuntime(DSAValueMapTy &DSAValueMap,
                                     ValueToValueMapTy *VMap, const DebugLoc &DL,
                                     Function *Fn, BasicBlock *BBEntry,
                                     BasicBlock *StartBB, BasicBlock *EndBB,
                                     BasicBlock *AfterBB,
                                     FinalizeCallbackTy FiniCB,
                                     ParRegionInfoStruct &ParRegionInfo);
-  void emitOMPParallelHostRuntime(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPParallelHostRuntime(DSAValueMapTy &DSAValueMap,
                                     ValueToValueMapTy *VMap, const DebugLoc &DL,
                                     Function *Fn, BasicBlock *BBEntry,
                                     BasicBlock *StartBB, BasicBlock *EndBB,
@@ -298,12 +318,12 @@ private:
                                     FinalizeCallbackTy FiniCB,
                                     ParRegionInfoStruct &ParRegionInfo);
 
-  void emitOMPTeamsDeviceRuntime(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPTeamsDeviceRuntime(DSAValueMapTy &DSAValueMap,
                           ValueToValueMapTy *VMap, const DebugLoc &DL,
                           Function *Fn, BasicBlock *BBEntry,
                           BasicBlock *StartBB, BasicBlock *EndBB,
                           BasicBlock *AfterBB, TeamsInfoStruct &TeamsInfo);
-  void emitOMPTeamsHostRuntime(MapVector<Value *, DSAType> &DSAValueMap,
+  void emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
                                ValueToValueMapTy *VMap, const DebugLoc &DL,
                                Function *Fn, BasicBlock *BBEntry,
                                BasicBlock *StartBB, BasicBlock *EndBB,
@@ -311,13 +331,13 @@ private:
 
   void emitOMPTargetHost(Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
                          BasicBlock *EndBB,
-                         MapVector<Value *, DSAType> &DSAValueMap,
+                         DSAValueMapTy &DSAValueMap,
                          MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                              &StructMappingInfoMap,
                          TargetInfoStruct &TargetInfo);
   void emitOMPTargetDevice(Function *Fn, BasicBlock *BBEntry,
                            BasicBlock *StartBB, BasicBlock *EndBB,
-                           MapVector<Value *, DSAType> &DSAValueMap,
+                           DSAValueMapTy &DSAValueMap,
                            MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                                &StructMappingInfoMap,
                            TargetInfoStruct &TargetInfo);

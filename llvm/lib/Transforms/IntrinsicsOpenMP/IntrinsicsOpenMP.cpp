@@ -77,7 +77,7 @@ struct IntrinsicsOpenMP : public ModulePass {
       // from the operand bundles of the intrinsic call.
       Directive Dir = OMPD_unknown;
       SmallVector<OperandBundleDef, 16> OpBundles;
-      MapVector<Value *, DSAType> DSAValueMap;
+      DSAValueMapTy DSAValueMap;
 
       OMPLoopInfoStruct OMPLoopInfo;
       ParRegionInfoStruct ParRegionInfo;
@@ -138,7 +138,7 @@ struct IntrinsicsOpenMP : public ModulePass {
             assert(O.input_size() == 1 && "Expected single if condition value");
             ParRegionInfo.IfCondition = TagInputs[0];
           } else if (Tag.startswith("QUAL.OMP.REDUCTION.ADD")) {
-            DSAValueMap[TagInputs[0]] = DSA_REDUCTION_ADD;
+            DSAValueMap[TagInputs[0]] = DSATypeInfo(DSA_REDUCTION_ADD);
           } else if (Tag.startswith("QUAL.OMP.TARGET.DEV_FUNC")) {
             assert(O.input_size() == 1 &&
                    "Expected a single device function name");
@@ -206,9 +206,26 @@ struct IntrinsicsOpenMP : public ModulePass {
               StructMappingInfoMap[TagInputs[0]].push_back(
                   {Index, Offset, NumElements, It->second});
 
-              DSAValueMap[TagInputs[0]] = DSA_MAP_STRUCT;
-            } else
-              DSAValueMap[TagInputs[0]] = It->second;
+              DSAValueMap[TagInputs[0]] = DSATypeInfo(DSA_MAP_STRUCT);
+            } else {
+              // This firstprivate includes a copy-constructor operand.
+              if ((It->second == DSA_FIRSTPRIVATE ||
+                   It->second == DSA_LASTPRIVATE) &&
+                  TagInputs.size() == 2) {
+                Value *V = TagInputs[0];
+                ConstantDataArray *CopyFnNameArray =
+                    dyn_cast<ConstantDataArray>(TagInputs[1]);
+                assert(CopyFnNameArray && "Expected constant string for the "
+                                          "copy-constructor function");
+                StringRef CopyFnName = CopyFnNameArray->getAsString();
+                FunctionCallee CopyConstructor = M.getOrInsertFunction(
+                    CopyFnName, V->getType()->getPointerElementType(),
+                    V->getType()->getPointerElementType());
+                DSAValueMap[TagInputs[0]] =
+                    DSATypeInfo(It->second, CopyConstructor);
+              } else
+                DSAValueMap[TagInputs[0]] = DSATypeInfo(It->second);
+            }
           }
         } else if (Tag == "OMP.DEVICE")
           IsDeviceTargetRegion = true;
@@ -290,7 +307,11 @@ struct IntrinsicsOpenMP : public ModulePass {
       } else if (Dir == OMPD_teams) {
         CGIOMP.emitOMPTeams(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
                             EndBB, AfterBB, TeamsInfo);
-      } else if (Dir == OMPD_target_teams) {
+      } else if (Dir == OMPD_distribute) {
+        CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
+                                 /* IsStandalone */ true);
+      }
+      else if (Dir == OMPD_target_teams) {
         CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
                                   AfterBB, TargetInfo, StructMappingInfoMap,
                                   IsDeviceTargetRegion);
