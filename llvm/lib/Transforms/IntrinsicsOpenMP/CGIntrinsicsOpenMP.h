@@ -176,10 +176,9 @@ struct CGReduction {
   }
 
   static OpenMPIRBuilder::InsertPointTy
-  sumAtomicReduction(OpenMPIRBuilder::InsertPointTy IP, Value *LHS,
+  sumAtomicReduction(OpenMPIRBuilder::InsertPointTy IP, Type *VTy, Value *LHS,
                      Value *RHS) {
     IRBuilder<> Builder(IP.getBlock(), IP.getPoint());
-    Type *VTy = RHS->getType()->getPointerElementType();
     Value *Partial = Builder.CreateLoad(VTy, RHS, "red.partial");
     if (VTy->isIntegerTy())
       Builder.CreateAtomicRMW(AtomicRMWInst::Add, LHS, Partial, None,
