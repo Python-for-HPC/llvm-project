@@ -316,6 +316,11 @@ private:
                                     BasicBlock *AfterBB,
                                     FinalizeCallbackTy FiniCB,
                                     ParRegionInfoStruct &ParRegionInfo);
+  void emitOMPParallelHostRuntimeOMPIRBuilder(
+      DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL,
+      Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+      BasicBlock *AfterBB, FinalizeCallbackTy FiniCB,
+      ParRegionInfoStruct &ParRegionInfo);
 
   void emitOMPTeamsDeviceRuntime(DSAValueMapTy &DSAValueMap,
                           ValueToValueMapTy *VMap, const DebugLoc &DL,
