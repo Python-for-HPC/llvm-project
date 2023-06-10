@@ -346,8 +346,8 @@ private:
                                &StructMappingInfoMap,
                            TargetInfoStruct &TargetInfo);
 
-
   FunctionCallee getKmpcForStaticInit(Type *Ty);
+  CallInst *createCheckedCall(FunctionCallee Fn, ArrayRef<Value *> Args);
   bool isOpenMPDeviceRuntime();
 
 };

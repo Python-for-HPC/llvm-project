@@ -11,6 +11,27 @@ using namespace llvm;
 using namespace omp;
 using namespace iomp;
 
+CallInst *CGIntrinsicsOpenMP::createCheckedCall(FunctionCallee Fn,
+                                           ArrayRef<Value *> Args) {
+  if (Args.size() != Fn.getFunctionType()->getNumParams()) {
+    LLVM_DEBUG(dbgs() << "Mismatch argument size " << Args.size() << " != "
+                      << Fn.getFunctionType()->getNumParams() << "\n");
+    return nullptr;
+  }
+
+  for (size_t I = 0; I < Args.size(); ++I) {
+    if (Args[I]->getType() != Fn.getFunctionType()->getParamType(I)) {
+      LLVM_DEBUG(dbgs() << "Mismatch type at " << I << "\n";
+                 dbgs() << "Arg " << *Args[I] << "\n";
+                 dbgs() << "Expected type "
+                        << *Fn.getFunctionType()->getParamType(I) << "\n";);
+      return nullptr;
+    }
+  }
+
+  return OMPBuilder.Builder.CreateCall(Fn, Args);
+}
+
 Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
     Function *OuterFn, BasicBlock *BBEntry, BasicBlock *StartBB,
@@ -303,6 +324,10 @@ CGIntrinsicsOpenMP::CGIntrinsicsOpenMP(Module &M) : OMPBuilder(M), M(M) {
                                           OMPBuilder.Int8Ptr, OMPBuilder.SizeTy,
                                           OMPBuilder.Int32, OMPBuilder.Int32},
                                          "struct.__tgt_offload_entry");
+  // OpenMP device runtime expects this global that controls debugging, default
+  // to 0 (no debugging enabled).
+  if (isOpenMPDeviceRuntime())
+    OMPBuilder.createGlobalFlag(0, "__omp_rtl_debug_kind");
 }
 
 void CGIntrinsicsOpenMP::emitOMPParallel(
@@ -377,7 +402,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntime(
       ForkArgs.push_back(CapturedVars[Idx]);
     }
 
-    auto *CI = OMPBuilder.Builder.CreateCall(ForkCall, ForkArgs);
+    OMPBuilder.Builder.CreateCall(ForkCall, ForkArgs);
   };
 
   auto EmitSerializedParallel = [&](InsertPointTy InsertIP) {
@@ -764,6 +789,9 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
 
   if (!NumThreads)
     NumThreads = ConstantInt::get(OMPBuilder.Int32, -1);
+  else
+    NumThreads =
+        OMPBuilder.Builder.CreateTruncOrBitCast(NumThreads, OMPBuilder.Int32);
 
   FunctionCallee KmpcParallel51 =
       OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_parallel_51);
@@ -784,10 +812,19 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
       OMPBuilder.Builder.CreateBitCast(OutlinedWrapperFn, OMPBuilder.VoidPtr);
   Value *CapturedVarAddrsBitcast = OMPBuilder.Builder.CreateBitCast(
       CapturedVarsAddrs, OMPBuilder.VoidPtrPtr);
-  OMPBuilder.Builder.CreateCall(
-      KmpcParallel51,
-      {Ident, ThreadID, IfCondition, NumThreads, ProcBind, OutlinedFnBitcast,
-       OutlinedWrapperFnBitcast, CapturedVarAddrsBitcast, NumCapturedArgs});
+
+  SmallVector<Value *, 10> Args = {Ident,
+                                   ThreadID,
+                                   IfCondition,
+                                   NumThreads,
+                                   ProcBind,
+                                   OutlinedFnBitcast,
+                                   OutlinedWrapperFnBitcast,
+                                   CapturedVarAddrsBitcast,
+                                   NumCapturedArgs};
+
+  auto *CI = createCheckedCall(KmpcParallel51, Args);
+  assert(CI && "Expected non-null call instr from code generation");
   OMPBuilder.Builder.CreateBr(AfterBB);
 
   LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
@@ -1897,7 +1934,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
 
   uint32_t SrcLocStrSize;
   Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc, SrcLocStrSize);
-  Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr, SrcLocStrSize);
+  Value *Ident = OMPBuilder.getOrCreateIdent(SrcLocStr, SrcLocStrSize);
 
   // TODO: should we use target_mapper without teams or the more general
   // target_teams_mapper. Does the former buy us anything (less overhead?)
@@ -1914,17 +1951,38 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
   emitOMPOffloadingMappings(AllocaIP, DSAValueMap, StructMappingInfoMap,
                             OffloadingMappingArgs, /* isTargetRegion */ true);
 
-  auto *OffloadResult = OMPBuilder.Builder.CreateCall(
-      TargetMapper,
-      {SrcLoc, ConstantInt::get(OMPBuilder.Int64, -1),
-       ConstantExpr::getBitCast(OMPRegionId, OMPBuilder.Int8Ptr),
-       ConstantInt::get(OMPBuilder.Int32, OffloadingMappingArgs.Size),
-       OffloadingMappingArgs.BasePtrs, OffloadingMappingArgs.Ptrs,
-       OffloadingMappingArgs.Sizes, OffloadingMappingArgs.MapTypes,
-       OffloadingMappingArgs.MapNames,
-       // TODO: offload_mappers is null for now.
-       Constant::getNullValue(OMPBuilder.VoidPtrPtr), TargetInfo.NumTeams,
-       TargetInfo.ThreadLimit});
+  auto CreateScalarCast = [&](Type *DestTy, Value *V) {
+    Value *Scalar = nullptr;
+    assert(V && "Expected non-null value");
+    if (V->getType()->isPointerTy()) {
+      Value *Load = OMPBuilder.Builder.CreateLoad(
+          V->getType()->getPointerElementType(), V);
+      Scalar = OMPBuilder.Builder.CreateTruncOrBitCast(Load, DestTy);
+    } else {
+      Scalar = OMPBuilder.Builder.CreateTruncOrBitCast(V, DestTy);
+    }
+
+    return Scalar;
+  };
+
+  Value *NumTeams = CreateScalarCast(OMPBuilder.Int32, TargetInfo.NumTeams);
+  Value *ThreadLimit = CreateScalarCast(OMPBuilder.Int32, TargetInfo.ThreadLimit);
+
+  assert(NumTeams && "Expected non-null NumTeams");
+  assert(ThreadLimit && "Expected non-null ThreadLimit");
+
+  SmallVector<Value *, 16> Args = {
+      Ident, ConstantInt::get(OMPBuilder.Int64, -1),
+      ConstantExpr::getBitCast(OMPRegionId, OMPBuilder.VoidPtr),
+      ConstantInt::get(OMPBuilder.Int32, OffloadingMappingArgs.Size),
+      OffloadingMappingArgs.BasePtrs, OffloadingMappingArgs.Ptrs,
+      OffloadingMappingArgs.Sizes, OffloadingMappingArgs.MapTypes,
+      OffloadingMappingArgs.MapNames,
+      // TODO: offload_mappers is null for now.
+      Constant::getNullValue(OMPBuilder.VoidPtrPtr), NumTeams, ThreadLimit};
+
+  auto *OffloadResult = createCheckedCall(TargetMapper, Args);
+  assert(OffloadResult && "Expected non-null call inst from code generation");
   auto *Failed = OMPBuilder.Builder.CreateIsNotNull(OffloadResult);
   OMPBuilder.Builder.CreateCondBr(Failed, StartBB, EndBB);
   EntryBB->getTerminator()->eraseFromParent();
