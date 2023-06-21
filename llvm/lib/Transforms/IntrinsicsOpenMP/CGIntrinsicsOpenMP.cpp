@@ -4,6 +4,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Frontend/OpenMP/OMPConstants.h"
 
 #define DEBUG_TYPE "intrinsics-openmp"
 
@@ -89,7 +90,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     else if (DSA_FIRSTPRIVATE == DSA)
       CapturedFirstprivate.push_back(V);
     // Treat lastprivate as shared to capture the pointer.
-    else if (DSA_SHARED == DSA || DSA_LASTPRIVATE == DSA)
+    else if (DSA_SHARED == DSA || DSA_LASTPRIVATE == DSA || DSA_MAP_TO == DSA ||
+             DSA_MAP_STRUCT == DSA)
       CapturedShared.push_back(V);
     else if (DSA_REDUCTION_ADD == DSA)
       Reductions.push_back(V);
@@ -2062,11 +2064,11 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
   Builder.CreateRetVoid();
 
   if (isOpenMPDeviceRuntime()) {
-    constexpr int OMP_TGT_GENERIC_EXEC_MODE = 1;
     // Emit OMP device globals and metadata.
+    // TODO: Make the exec_mode a parameter and use SPMD when possible.
     auto *ExecModeGV = new GlobalVariable(
         M, OMPBuilder.Int8, /* isConstant */ false, GlobalValue::WeakAnyLinkage,
-        Builder.getInt8(OMP_TGT_GENERIC_EXEC_MODE),
+        Builder.getInt8(OMP_TGT_EXEC_MODE_GENERIC),
         DevWrapperFuncName + "_exec_mode");
     appendToCompilerUsed(M, {ExecModeGV});
 
@@ -2082,7 +2084,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
     MD->addOperand(MDNode::get(M.getContext(), MDVals));
 
     // Add a function attribute for the kernel.
-    Fn->addFnAttr(Attribute::get(M.getContext(), "kernel"));
+    NumbaWrapperFunc->addFnAttr(Attribute::get(M.getContext(), "kernel"));
 
   } else {
     // Generating an offloading entry is required by the x86_64 plugin.
@@ -2561,6 +2563,10 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
   Value *PStart = nullptr;
   Value *PLowerBound = nullptr;
   Value *PUpperBound = nullptr;
+
+  // TODO: Remove, the fololowing code is unneeded, loop info values are passed
+  // by val.
+  /*
   if (isOpenMPDeviceRuntime()) {
     // Create globalized allocation pointers for the start and distribute loop
     // bounds to be shareable with parallel threads.
@@ -2586,16 +2592,16 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
     PUpperBound = OMPBuilder.Builder.CreateBitCast(
         PUpperBoundAlloc, IVTy->getPointerTo(), "omp.distribute.ub");
     // OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.ub");
-  } else {
-    // Create globalized allocation pointers for the start and distribute loop
-    // bounds to be shareable with parallel threads.
-    PStart =
-        OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.start");
-    PLowerBound =
-        OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.lb");
-    PUpperBound =
-        OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.ub");
   }
+  */
+  // Create globalized allocation pointers for the start and distribute loop
+  // bounds to be shareable with parallel threads.
+  PStart =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.start");
+  PLowerBound =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.lb");
+  PUpperBound =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.ub");
 
   assert(PStart && "Expected non-null PStart");
   assert(PLowerBound && "Expected non-null PLowerBound");
