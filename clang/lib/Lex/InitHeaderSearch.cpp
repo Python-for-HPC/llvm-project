@@ -25,6 +25,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace clang;
@@ -249,7 +250,10 @@ void InitHeaderSearch::AddDefaultCIncludePaths(const llvm::Triple &triple,
       [[fallthrough]];
     default:
       // FIXME: temporary hack: hard-coded paths.
-      AddPath("/usr/local/include", System, false);
+      Optional<std::string> CondaBuildSysrootValue =
+              llvm::sys::Process::GetEnv("CONDA_BUILD_SYSROOT");
+      if (!CondaBuildSysrootValue.has_value())
+        AddPath("/usr/local/include", System, false);
       break;
     }
   }
