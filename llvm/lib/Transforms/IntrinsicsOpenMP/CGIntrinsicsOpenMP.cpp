@@ -1,6 +1,7 @@
 #include "CGIntrinsicsOpenMP.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
@@ -12,8 +13,8 @@ using namespace llvm;
 using namespace omp;
 using namespace iomp;
 
-CallInst *CGIntrinsicsOpenMP::createCheckedCall(FunctionCallee Fn,
-                                           ArrayRef<Value *> Args) {
+CallInst *CGIntrinsicsOpenMP::checkCreateCall(FunctionCallee Fn,
+                                              ArrayRef<Value *> Args) {
   if (Args.size() != Fn.getFunctionType()->getNumParams()) {
     LLVM_DEBUG(dbgs() << "Mismatch argument size " << Args.size() << " != "
                       << Fn.getFunctionType()->getNumParams() << "\n");
@@ -707,7 +708,9 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
       Value *Bitcast =
           OMPBuilder.Builder.CreateBitCast(GEP, CapturedVars[Idx]->getType());
       Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, Bitcast);
-      OutlinedFnArgs.push_back(Load);
+      // TODO: Runtime expects values in Int64 type.
+      Value *Cast= OMPBuilder.Builder.CreateZExtOrBitCast(Load, OMPBuilder.Int64);
+      OutlinedFnArgs.push_back(Cast);
 
       continue;
     }
@@ -719,8 +722,9 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
     OutlinedFnArgs.push_back(Load);
   }
 
-  OMPBuilder.Builder.CreateCall(OutlinedFn->getFunctionType(), OutlinedFn,
-                                OutlinedFnArgs);
+  FunctionCallee OutlinedFnCallee(OutlinedFn->getFunctionType(), OutlinedFn);
+  assert(checkCreateCall(OutlinedFnCallee, OutlinedFnArgs) &&
+         "Expected valid call");
   OMPBuilder.Builder.CreateRetVoid();
 
   if (verifyFunction(*OutlinedWrapperFn, &errs()))
@@ -825,7 +829,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
                                    CapturedVarAddrsBitcast,
                                    NumCapturedArgs};
 
-  auto *CI = createCheckedCall(KmpcParallel51, Args);
+  auto *CI = checkCreateCall(KmpcParallel51, Args);
   assert(CI && "Expected non-null call instr from code generation");
   OMPBuilder.Builder.CreateBr(AfterBB);
 
@@ -1983,7 +1987,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
       // TODO: offload_mappers is null for now.
       Constant::getNullValue(OMPBuilder.VoidPtrPtr), NumTeams, ThreadLimit};
 
-  auto *OffloadResult = createCheckedCall(TargetMapper, Args);
+  auto *OffloadResult = checkCreateCall(TargetMapper, Args);
   assert(OffloadResult && "Expected non-null call inst from code generation");
   auto *Failed = OMPBuilder.Builder.CreateIsNotNull(OffloadResult);
   OMPBuilder.Builder.CreateCondBr(Failed, StartBB, EndBB);
@@ -2146,14 +2150,15 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
             ->isSingleValueType()) {
       Type *VPtrElemTy = CapturedVars[Idx]->getType()->getPointerElementType();
       Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, CapturedVars[Idx]);
-      Args.push_back(Load);
+      Value *Cast= OMPBuilder.Builder.CreateZExtOrBitCast(Load, OMPBuilder.Int64);
+      Args.push_back(Cast);
 
       continue;
     }
     Args.push_back(CapturedVars[Idx]);
   }
 
-  OMPBuilder.Builder.CreateCall(TeamsOutlinedFn, Args);
+  assert(checkCreateCall(TeamsOutlinedFn, Args) && "Expected valid call");
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 
@@ -2163,6 +2168,7 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
   if (verifyFunction(*Fn, &errs()))
     report_fatal_error("Verification of OuterFn failed!");
 }
+
 void CGIntrinsicsOpenMP::emitOMPTeams(DSAValueMapTy &DSAValueMap,
                                       ValueToValueMapTy *VMap,
                                       const DebugLoc &DL, Function *Fn,
