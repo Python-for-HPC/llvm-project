@@ -159,13 +159,22 @@ struct IntrinsicsOpenMP : public ModulePass {
             switch(Dir) {
               case OMPD_target:
                 TargetInfo.NumTeams = TagInputs[0];
+                TargetInfo.ExecMode =
+                    OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
                 break;
               case OMPD_teams:
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
               case OMPD_target_teams:
               case OMPD_target_teams_distribute:
+                TargetInfo.ExecMode =
+                    OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
+                TargetInfo.NumTeams = TagInputs[0];
+                TeamsInfo.NumTeams = TagInputs[0];
+                break;
               case OMPD_target_teams_distribute_parallel_for:
+                TargetInfo.ExecMode =
+                    OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_SPMD;
                 TargetInfo.NumTeams = TagInputs[0];
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
@@ -303,18 +312,18 @@ struct IntrinsicsOpenMP : public ModulePass {
       } else if (Dir == OMPD_target) {
         CGIOMP.emitOMPTarget(Fn, BBEntry, StartBB, EndBB, DSAValueMap,
                              StructMappingInfoMap, TargetInfo,
-                             IsDeviceTargetRegion);
+                             /* OMPLoopInfo */ nullptr, IsDeviceTargetRegion);
       } else if (Dir == OMPD_teams) {
         CGIOMP.emitOMPTeams(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
                             EndBB, AfterBB, TeamsInfo);
       } else if (Dir == OMPD_distribute) {
         CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
                                  /* IsStandalone */ true);
-      }
-      else if (Dir == OMPD_target_teams) {
+      } else if (Dir == OMPD_target_teams) {
         CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                                  AfterBB, TargetInfo, StructMappingInfoMap,
-                                  IsDeviceTargetRegion);
+                                  AfterBB, TargetInfo,
+                                  /* OMPLoopInfo */ nullptr,
+                                  StructMappingInfoMap, IsDeviceTargetRegion);
       } else if (Dir == OMPD_target_enter_data) {
         if (IsDeviceTargetRegion)
           report_fatal_error("Target enter data should never appear inside a "
@@ -333,8 +342,8 @@ struct IntrinsicsOpenMP : public ModulePass {
         CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
                                  /* IsStandalone */ false);
         CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
-                                  AfterBB, TargetInfo, StructMappingInfoMap,
-                                  IsDeviceTargetRegion);
+                                  AfterBB, TargetInfo, &OMPLoopInfo,
+                                  StructMappingInfoMap, IsDeviceTargetRegion);
       } else if (Dir == OMPD_distribute_parallel_for) {
         CGIOMP.emitOMPDistributeParallelFor(DSAValueMap, StartBB, BBExit,
                                             OMPLoopInfo, ParRegionInfo,

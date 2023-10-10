@@ -148,6 +148,7 @@ struct TargetInfoStruct {
   ConstantDataArray *ELF = nullptr;
   Value *NumTeams = nullptr;
   Value *ThreadLimit = nullptr;
+  OMPTgtExecModeFlags ExecMode = (OMPTgtExecModeFlags)0;
 };
 
 struct ParRegionInfoStruct {
@@ -237,11 +238,11 @@ public:
   void emitOMPTaskwait(BasicBlock *BBEntry);
 
   void emitOMPTarget(Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
-                     BasicBlock *EndBB,
-                     DSAValueMapTy &DSAValueMap,
+                     BasicBlock *EndBB, DSAValueMapTy &DSAValueMap,
                      MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                          &StructMappingInfoMap,
-                     TargetInfoStruct &TargetInfo, bool IsDeviceTargetRegion);
+                     TargetInfoStruct &TargetInfo,
+                     OMPLoopInfoStruct *OMPLoopInfo, bool IsDeviceTargetRegion);
 
   void emitOMPTeams(DSAValueMapTy &DSAValueMap,
                     ValueToValueMapTy *VMap, const DebugLoc &DL, Function *Fn,
@@ -279,11 +280,11 @@ public:
           &StructMappingInfoMap,
       bool IsDeviceTargetRegion);
 
-  void emitOMPTargetTeams(DSAValueMapTy &DSAValueMap,
-                          const DebugLoc &DL, Function *Fn, BasicBlock *EntryBB,
+  void emitOMPTargetTeams(DSAValueMapTy &DSAValueMap, const DebugLoc &DL,
+                          Function *Fn, BasicBlock *EntryBB,
                           BasicBlock *StartBB, BasicBlock *EndBB,
-                          BasicBlock *AfterBB,
-                          TargetInfoStruct &TargetInfo,
+                          BasicBlock *AfterBB, TargetInfoStruct &TargetInfo,
+                          OMPLoopInfoStruct *OMPLoopInfo,
                           MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                               &StructMappingInfoMap,
                           bool IsDeviceTargetRegion);
@@ -334,11 +335,12 @@ private:
                                BasicBlock *AfterBB, TeamsInfoStruct &TeamsInfo);
 
   void emitOMPTargetHost(Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
-                         BasicBlock *EndBB,
-                         DSAValueMapTy &DSAValueMap,
+                         BasicBlock *EndBB, DSAValueMapTy &DSAValueMap,
                          MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
                              &StructMappingInfoMap,
-                         TargetInfoStruct &TargetInfo);
+                         TargetInfoStruct &TargetInfo,
+                         OMPLoopInfoStruct *OMPLoopInfo);
+
   void emitOMPTargetDevice(Function *Fn, BasicBlock *BBEntry,
                            BasicBlock *StartBB, BasicBlock *EndBB,
                            DSAValueMapTy &DSAValueMap,

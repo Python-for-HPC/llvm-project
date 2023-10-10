@@ -1914,20 +1914,21 @@ void CGIntrinsicsOpenMP::emitOMPTarget(
     Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     DSAValueMapTy &DSAValueMap,
     MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
-    TargetInfoStruct &TargetInfo, bool IsDeviceTargetRegion) {
+    TargetInfoStruct &TargetInfo, OMPLoopInfoStruct *OMPLoopInfo,
+    bool IsDeviceTargetRegion) {
   if (IsDeviceTargetRegion)
     emitOMPTargetDevice(Fn, EntryBB, StartBB, EndBB, DSAValueMap,
                         StructMappingInfoMap, TargetInfo);
   else
     emitOMPTargetHost(Fn, EntryBB, StartBB, EndBB, DSAValueMap,
-                  StructMappingInfoMap, TargetInfo);
+                      StructMappingInfoMap, TargetInfo, OMPLoopInfo);
 }
 
 void CGIntrinsicsOpenMP::emitOMPTargetHost(
     Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     DSAValueMapTy &DSAValueMap,
     MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
-    TargetInfoStruct &TargetInfo) {
+    TargetInfoStruct &TargetInfo, OMPLoopInfoStruct *OMPLoopInfo) {
 
   Twine DevWrapperFuncName = getDevWrapperFuncPrefix() + TargetInfo.DevFuncName;
 
@@ -1956,6 +1957,22 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
                          Fn->getEntryBlock().getFirstInsertionPt());
   emitOMPOffloadingMappings(AllocaIP, DSAValueMap, StructMappingInfoMap,
                             OffloadingMappingArgs, /* isTargetRegion */ true);
+
+
+  // Push the tripcount.
+  if (OMPLoopInfo) {
+    FunctionCallee TripcountMapper = OMPBuilder.getOrCreateRuntimeFunction(
+        M,
+        llvm::omp::RuntimeFunction::OMPRTL___kmpc_push_target_tripcount_mapper);
+    Value *Load =
+        OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, OMPLoopInfo->UB);
+    Value *Tripcount = OMPBuilder.Builder.CreateAdd(
+        Load, ConstantInt::get(OMPBuilder.Int64, 1));
+    assert(checkCreateCall(
+               TripcountMapper,
+               {Ident, ConstantInt::get(OMPBuilder.Int64, -1), Tripcount}) &&
+           "Expected non-null call");
+  }
 
   auto CreateScalarCast = [&](Type *DestTy, Value *V) {
     Value *Scalar = nullptr;
@@ -2068,11 +2085,12 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
   Builder.CreateRetVoid();
 
   if (isOpenMPDeviceRuntime()) {
+    assert(TargetInfo.ExecMode && "Expected non-zero ExecMode");
     // Emit OMP device globals and metadata.
     // TODO: Make the exec_mode a parameter and use SPMD when possible.
     auto *ExecModeGV = new GlobalVariable(
         M, OMPBuilder.Int8, /* isConstant */ false, GlobalValue::WeakAnyLinkage,
-        Builder.getInt8(OMP_TGT_EXEC_MODE_GENERIC),
+        Builder.getInt8(TargetInfo.ExecMode),
         DevWrapperFuncName + "_exec_mode");
     appendToCompilerUsed(M, {ExecModeGV});
 
@@ -2779,7 +2797,8 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
                                /* isStandalone */ false);
   // Lower target_teams.
   emitOMPTargetTeams(DSAValueMap, DL, Fn, EntryBB, StartBB, EndBB, AfterBB,
-                     TargetInfo, StructMappingInfoMap, IsDeviceTargetRegion);
+                     TargetInfo, &OMPLoopInfo, StructMappingInfoMap,
+                     IsDeviceTargetRegion);
 
   // Alternative codegen, starting from top-down and renaming values using the
   // ValueToValueMap.
@@ -2834,6 +2853,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeams(
     DSAValueMapTy &DSAValueMap, const DebugLoc &DL, Function *Fn,
     BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     BasicBlock *AfterBB, TargetInfoStruct &TargetInfo,
+    OMPLoopInfoStruct *OMPLoopInfo,
     MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
     bool IsDeviceTargetRegion) {
 
@@ -2853,7 +2873,8 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeams(
                TeamsEndBB, EndBB, TeamsInfo);
 
   emitOMPTarget(Fn, EntryBB, TeamsEntryBB, EndBB, DSAValueMap,
-                StructMappingInfoMap, TargetInfo, IsDeviceTargetRegion);
+                StructMappingInfoMap, TargetInfo, OMPLoopInfo,
+                IsDeviceTargetRegion);
 }
 
 bool CGIntrinsicsOpenMP::isOpenMPDeviceRuntime() {
