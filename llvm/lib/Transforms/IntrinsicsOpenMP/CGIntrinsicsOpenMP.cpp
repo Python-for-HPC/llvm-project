@@ -1760,7 +1760,7 @@ CGIntrinsicsOpenMP::emitOffloadingGlobals(StringRef DevWrapperFuncName,
   auto *ArrayTy = ArrayType::get(TgtOffloadEntryTy, 1);
   OMPOffloadEntries =
       new GlobalVariable(M, ArrayTy,
-                         /* isConstant */ true, GlobalValue::ExternalLinkage,
+                         /* isConstant */ true, GlobalValue::InternalLinkage,
                          ConstantArray::get(ArrayTy, {OMPOffloadEntry}),
                          ".omp_offloading.entries");
 
