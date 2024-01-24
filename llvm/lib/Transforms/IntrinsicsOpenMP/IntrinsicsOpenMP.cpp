@@ -204,23 +204,24 @@ struct IntrinsicsOpenMP : public ModulePass {
           } else /* DSA Qualifiers */ {
             auto It = StringToDSA.find(Tag);
             assert(It != StringToDSA.end() && "DSA type not found in map");
-            if (It->second == DSA_MAP_TO_STRUCT ||
+            if (It->second == DSA_MAP_ALLOC_STRUCT ||
+                It->second == DSA_MAP_TO_STRUCT ||
                 It->second == DSA_MAP_FROM_STRUCT ||
                 It->second == DSA_MAP_TOFROM_STRUCT) {
-              assert((TagInputs.size() - 1) == 3 &&
-                     "Expected input triple for struct mapping");
-              Value *Index = TagInputs[1];
-              Value *Offset = TagInputs[2];
-              Value *NumElements = TagInputs[3];
-              StructMappingInfoMap[TagInputs[0]].push_back(
-                  {Index, Offset, NumElements, It->second});
+                assert((TagInputs.size() - 1) == 3 &&
+                       "Expected input triple for struct mapping");
+                Value *Index = TagInputs[1];
+                Value *Offset = TagInputs[2];
+                Value *NumElements = TagInputs[3];
+                StructMappingInfoMap[TagInputs[0]].push_back(
+                    {Index, Offset, NumElements, It->second});
 
-              DSAValueMap[TagInputs[0]] = DSATypeInfo(DSA_MAP_STRUCT);
+                DSAValueMap[TagInputs[0]] = DSATypeInfo(DSA_MAP_STRUCT);
             } else {
-              // This firstprivate includes a copy-constructor operand.
-              if ((It->second == DSA_FIRSTPRIVATE ||
-                   It->second == DSA_LASTPRIVATE) &&
-                  TagInputs.size() == 2) {
+                // This firstprivate includes a copy-constructor operand.
+                if ((It->second == DSA_FIRSTPRIVATE ||
+                     It->second == DSA_LASTPRIVATE) &&
+                    TagInputs.size() == 2) {
                 Value *V = TagInputs[0];
                 ConstantDataArray *CopyFnNameArray =
                     dyn_cast<ConstantDataArray>(TagInputs[1]);
@@ -232,7 +233,7 @@ struct IntrinsicsOpenMP : public ModulePass {
                     V->getType()->getPointerElementType());
                 DSAValueMap[TagInputs[0]] =
                     DSATypeInfo(It->second, CopyConstructor);
-              } else
+                } else
                 DSAValueMap[TagInputs[0]] = DSATypeInfo(It->second);
             }
           }

@@ -1458,6 +1458,12 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
       if (IsTargetRegion)
         MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
       break;
+    case DSA_MAP_ALLOC:
+      // Allocation is the default in the OpenMP runtime, no extra flags.
+      MapType = OMP_TGT_MAPTYPE_NONE;
+      if (IsTargetRegion)
+        MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
+      break;
     case DSA_MAP_TO:
       MapType = OMP_TGT_MAPTYPE_TO;
       if (IsTargetRegion)
@@ -1477,6 +1483,10 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
       MapType = OMP_TGT_MAPTYPE_NONE;
       if (IsTargetRegion)
         MapType |= OMP_TGT_MAPTYPE_TARGET_PARAM;
+      break;
+    case DSA_MAP_ALLOC_STRUCT:
+      // Allocation is the default in the OpenMP runtime, no extra flags.
+      MapType = OMP_TGT_MAPTYPE_NONE;
       break;
     case DSA_MAP_TO_STRUCT:
       MapType = OMP_TGT_MAPTYPE_TO;
@@ -1506,6 +1516,7 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
     // Emit the mapping entry.
     Value *Size;
     switch (DSA) {
+    case DSA_MAP_ALLOC:
     case DSA_MAP_TO:
     case DSA_MAP_FROM:
     case DSA_MAP_TOFROM:
