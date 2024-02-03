@@ -1,4 +1,5 @@
 #include "CGIntrinsicsOpenMP.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -13,15 +14,19 @@ using namespace llvm;
 using namespace omp;
 using namespace iomp;
 
-CallInst *CGIntrinsicsOpenMP::checkCreateCall(FunctionCallee Fn,
+CallInst *CGIntrinsicsOpenMP::checkCreateCall(FunctionCallee &Fn,
                                               ArrayRef<Value *> Args) {
-  if (Args.size() != Fn.getFunctionType()->getNumParams()) {
-    LLVM_DEBUG(dbgs() << "Mismatch argument size " << Args.size() << " != "
-                      << Fn.getFunctionType()->getNumParams() << "\n");
-    return nullptr;
-  }
+  // Check number of parameters only for non-vararg functions.
+  if (!Fn.getFunctionType()->isVarArg())
+    if (Args.size() != Fn.getFunctionType()->getNumParams()) {
+      LLVM_DEBUG(dbgs() << "Mismatch argument size " << Args.size() << " != "
+                        << Fn.getFunctionType()->getNumParams() << "\n");
+      return nullptr;
+    }
 
-  for (size_t I = 0; I < Args.size(); ++I) {
+  // Check argument types up to number params in the callee type to avoid
+  // checking varargs unknow types.
+  for (size_t I = 0; I < Fn.getFunctionType()->getNumParams(); ++I)
     if (Args[I]->getType() != Fn.getFunctionType()->getParamType(I)) {
       LLVM_DEBUG(dbgs() << "Mismatch type at " << I << "\n";
                  dbgs() << "Arg " << *Args[I] << "\n";
@@ -29,9 +34,22 @@ CallInst *CGIntrinsicsOpenMP::checkCreateCall(FunctionCallee Fn,
                         << *Fn.getFunctionType()->getParamType(I) << "\n";);
       return nullptr;
     }
-  }
 
   return OMPBuilder.Builder.CreateCall(Fn, Args);
+}
+
+Value *CGIntrinsicsOpenMP::createScalarCast(Value *V, Type *DestTy) {
+  Value *Scalar = nullptr;
+  assert(V && "Expected non-null value");
+  if (V->getType()->isPointerTy()) {
+    Value *Load =
+        OMPBuilder.Builder.CreateLoad(V->getType()->getPointerElementType(), V);
+    Scalar = OMPBuilder.Builder.CreateTruncOrBitCast(Load, DestTy);
+  } else {
+    Scalar = OMPBuilder.Builder.CreateTruncOrBitCast(V, DestTy);
+  }
+
+  return Scalar;
 }
 
 Function *CGIntrinsicsOpenMP::createOutlinedFunction(
@@ -451,10 +469,10 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntime(
   };
 
   if (ParRegionInfo.NumThreads) {
-    Value *Args[] = {Ident, ThreadID,
-                     OMPBuilder.Builder.CreateIntCast(ParRegionInfo.NumThreads,
-                                                      OMPBuilder.Int32,
-                                                      /*isSigned*/ false)};
+    Value *NumThreads =
+        createScalarCast(ParRegionInfo.NumThreads, OMPBuilder.Int32);
+    assert(NumThreads && "Expected non-null num threads");
+    Value *Args[] = {Ident, ThreadID, NumThreads};
     OMPBuilder.Builder.CreateCall(OMPBuilder.getOrCreateRuntimeFunctionPtr(
                                       OMPRTL___kmpc_push_num_threads),
                                   Args);
@@ -624,11 +642,15 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntimeOMPIRBuilder(
   OpenMPIRBuilder::LocationDescription Loc(
       InsertPointTy(BBEntry, BBEntry->end()), DL);
 
+  Value *NumThreads = nullptr;
+  // It is allowed to have a nullptr NumThreads, createParallel handles that.
+  if (ParRegionInfo.NumThreads)
+    NumThreads = createScalarCast(ParRegionInfo.NumThreads, OMPBuilder.Int32);
   // TODO: support cancellable, binding.
   InsertPointTy AfterIP = OMPBuilder.createParallel(
       Loc, AllocaIP, BodyGenCB, PrivCB, FiniCB,
       /* IfCondition */ IfConditionEval,
-      /* NumThreads */ ParRegionInfo.NumThreads, OMP_PROC_BIND_default,
+      /* NumThreads */ NumThreads, OMP_PROC_BIND_default,
       /* IsCancellable */ false);
 
   if (!ReductionInfos.empty())
@@ -798,6 +820,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
   else
     NumThreads =
         OMPBuilder.Builder.CreateTruncOrBitCast(NumThreads, OMPBuilder.Int32);
+
+  assert(NumThreads && "Expected non-null NumThreads");
 
   FunctionCallee KmpcParallel51 =
       OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_parallel_51);
@@ -1985,22 +2009,9 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
            "Expected non-null call");
   }
 
-  auto CreateScalarCast = [&](Type *DestTy, Value *V) {
-    Value *Scalar = nullptr;
-    assert(V && "Expected non-null value");
-    if (V->getType()->isPointerTy()) {
-      Value *Load = OMPBuilder.Builder.CreateLoad(
-          V->getType()->getPointerElementType(), V);
-      Scalar = OMPBuilder.Builder.CreateTruncOrBitCast(Load, DestTy);
-    } else {
-      Scalar = OMPBuilder.Builder.CreateTruncOrBitCast(V, DestTy);
-    }
-
-    return Scalar;
-  };
-
-  Value *NumTeams = CreateScalarCast(OMPBuilder.Int32, TargetInfo.NumTeams);
-  Value *ThreadLimit = CreateScalarCast(OMPBuilder.Int32, TargetInfo.ThreadLimit);
+  Value *NumTeams = createScalarCast(TargetInfo.NumTeams, OMPBuilder.Int32);
+  Value *ThreadLimit =
+      createScalarCast(TargetInfo.ThreadLimit, OMPBuilder.Int32);
 
   assert(NumTeams && "Expected non-null NumTeams");
   assert(ThreadLimit && "Expected non-null ThreadLimit");
@@ -2238,19 +2249,21 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
   Value *ThreadID = OMPBuilder.getOrCreateThreadID(Ident);
 
   assert(Ident && "Expected non-null Ident");
-
   // Emit call to set the number of teams and thread limit.
   if (TeamsInfo.NumTeams || TeamsInfo.ThreadLimit) {
     Value *NumTeams =
-        (TeamsInfo.NumTeams ? TeamsInfo.NumTeams
-                            : Constant::getNullValue(OMPBuilder.Int32));
+        (TeamsInfo.NumTeams
+             ? createScalarCast(TeamsInfo.NumTeams, OMPBuilder.Int32)
+             : Constant::getNullValue(OMPBuilder.Int32));
     Value *ThreadLimit =
-        (TeamsInfo.ThreadLimit ? TeamsInfo.ThreadLimit
-                               : Constant::getNullValue(OMPBuilder.Int32));
+        (TeamsInfo.ThreadLimit
+             ? createScalarCast(TeamsInfo.ThreadLimit, OMPBuilder.Int32)
+             : Constant::getNullValue(OMPBuilder.Int32));
     FunctionCallee KmpcPushNumTeams =
         OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_push_num_teams);
-    OMPBuilder.Builder.CreateCall(KmpcPushNumTeams,
-                                  {Ident, ThreadID, NumTeams, ThreadLimit});
+    assert(checkCreateCall(KmpcPushNumTeams,
+                           {Ident, ThreadID, NumTeams, ThreadLimit}) &&
+           "Expected valid call");
   }
 
   FunctionCallee ForkTeams =
@@ -2278,7 +2291,7 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
     Args.push_back(CapturedVars[Idx]);
   }
 
-  OMPBuilder.Builder.CreateCall(ForkTeams, Args);
+  assert(checkCreateCall(ForkTeams, Args) && "Expected valid call");
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 
