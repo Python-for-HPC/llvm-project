@@ -14,8 +14,23 @@ using namespace llvm;
 using namespace omp;
 using namespace iomp;
 
-CallInst *CGIntrinsicsOpenMP::checkCreateCall(FunctionCallee &Fn,
-                                              ArrayRef<Value *> Args) {
+namespace {
+
+static CallInst *checkCreateCall(IRBuilderBase &Builder, FunctionCallee &Fn,
+                                 ArrayRef<Value *> Args) {
+  auto PrintDebugOutput = [&]() {
+    dbgs() << "=== CGOpenMP checkCreateCall\n";
+    dbgs() << "FunctionCallee: " << Fn.getCallee()->getName() << "\n";
+    dbgs() << "FunctionCalee Type: " << *Fn.getFunctionType() << "\n";
+    size_t ArgNo = 0;
+    for (Value *Arg : Args) {
+      dbgs() << "Arg " << ArgNo << ": " << *Arg << "\n";
+      ArgNo++;
+    }
+    dbgs() << "=== End of CGOpenMP checkCreateCall\n";
+  };
+  LLVM_DEBUG(PrintDebugOutput());
+
   // Check number of parameters only for non-vararg functions.
   if (!Fn.getFunctionType()->isVarArg())
     if (Args.size() != Fn.getFunctionType()->getNumParams()) {
@@ -35,8 +50,10 @@ CallInst *CGIntrinsicsOpenMP::checkCreateCall(FunctionCallee &Fn,
       return nullptr;
     }
 
-  return OMPBuilder.Builder.CreateCall(Fn, Args);
+  return Builder.CreateCall(Fn, Args);
 }
+
+} // namespace
 
 Value *CGIntrinsicsOpenMP::createScalarCast(Value *V, Type *DestTy) {
   Value *Scalar = nullptr;
@@ -745,8 +762,9 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
   }
 
   FunctionCallee OutlinedFnCallee(OutlinedFn->getFunctionType(), OutlinedFn);
-  assert(checkCreateCall(OutlinedFnCallee, OutlinedFnArgs) &&
-         "Expected valid call");
+  assert(
+      checkCreateCall(OMPBuilder.Builder, OutlinedFnCallee, OutlinedFnArgs) &&
+      "Expected valid call");
   OMPBuilder.Builder.CreateRetVoid();
 
   if (verifyFunction(*OutlinedWrapperFn, &errs()))
@@ -853,8 +871,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
                                    CapturedVarAddrsBitcast,
                                    NumCapturedArgs};
 
-  auto *CI = checkCreateCall(KmpcParallel51, Args);
-  assert(CI && "Expected non-null call instr from code generation");
+  assert(checkCreateCall(OMPBuilder.Builder, KmpcParallel51, Args) &&
+         "Expected non-null call instr from code generation");
   OMPBuilder.Builder.CreateBr(AfterBB);
 
   LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
@@ -2004,9 +2022,9 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
     Value *Tripcount = OMPBuilder.Builder.CreateAdd(
         Load, ConstantInt::get(OMPBuilder.Int64, 1));
     assert(checkCreateCall(
-               TripcountMapper,
+               OMPBuilder.Builder, TripcountMapper,
                {Ident, ConstantInt::get(OMPBuilder.Int64, -1), Tripcount}) &&
-           "Expected non-null call");
+           "Expected valid call");
   }
 
   Value *NumTeams = createScalarCast(TargetInfo.NumTeams, OMPBuilder.Int32);
@@ -2026,7 +2044,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
       // TODO: offload_mappers is null for now.
       Constant::getNullValue(OMPBuilder.VoidPtrPtr), NumTeams, ThreadLimit};
 
-  auto *OffloadResult = checkCreateCall(TargetMapper, Args);
+  auto *OffloadResult = checkCreateCall(OMPBuilder.Builder, TargetMapper, Args);
   assert(OffloadResult && "Expected non-null call inst from code generation");
   auto *Failed = OMPBuilder.Builder.CreateIsNotNull(OffloadResult);
   OMPBuilder.Builder.CreateCondBr(Failed, StartBB, EndBB);
@@ -2095,8 +2113,8 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
                                           /* RequiresFullRuntime */ true);
     Builder.restoreIP(IP);
   }
-
-  Builder.CreateCall(DevFuncCallee, DevFuncArgs);
+  assert(checkCreateCall(Builder, DevFuncCallee, DevFuncArgs) &&
+         "Expected valid call");
 
   if (isOpenMPDeviceRuntime()) {
     OpenMPIRBuilder::LocationDescription Loc(Builder);
@@ -2198,7 +2216,8 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
     Args.push_back(CapturedVars[Idx]);
   }
 
-  assert(checkCreateCall(TeamsOutlinedFn, Args) && "Expected valid call");
+  assert(checkCreateCall(OMPBuilder.Builder, TeamsOutlinedFn, Args) &&
+         "Expected valid call");
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 
@@ -2261,7 +2280,7 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
              : Constant::getNullValue(OMPBuilder.Int32));
     FunctionCallee KmpcPushNumTeams =
         OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_push_num_teams);
-    assert(checkCreateCall(KmpcPushNumTeams,
+    assert(checkCreateCall(OMPBuilder.Builder, KmpcPushNumTeams,
                            {Ident, ThreadID, NumTeams, ThreadLimit}) &&
            "Expected valid call");
   }
@@ -2291,7 +2310,8 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
     Args.push_back(CapturedVars[Idx]);
   }
 
-  assert(checkCreateCall(ForkTeams, Args) && "Expected valid call");
+  assert(checkCreateCall(OMPBuilder.Builder, ForkTeams, Args) &&
+         "Expected valid call");
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 

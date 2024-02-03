@@ -353,7 +353,6 @@ private:
                            TargetInfoStruct &TargetInfo);
 
   FunctionCallee getKmpcForStaticInit(Type *Ty);
-  CallInst *checkCreateCall(FunctionCallee &Fn, ArrayRef<Value *> Args);
   Value *createScalarCast(Value *V, Type *DestTy);
   bool isOpenMPDeviceRuntime();
 
