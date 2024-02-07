@@ -159,22 +159,16 @@ struct IntrinsicsOpenMP : public ModulePass {
             switch(Dir) {
               case OMPD_target:
                 TargetInfo.NumTeams = TagInputs[0];
-                TargetInfo.ExecMode =
-                    OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
                 break;
               case OMPD_teams:
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
               case OMPD_target_teams:
               case OMPD_target_teams_distribute:
-                TargetInfo.ExecMode =
-                    OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
                 TargetInfo.NumTeams = TagInputs[0];
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
               case OMPD_target_teams_distribute_parallel_for:
-                TargetInfo.ExecMode =
-                    OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_SPMD;
                 TargetInfo.NumTeams = TagInputs[0];
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
@@ -311,6 +305,7 @@ struct IntrinsicsOpenMP : public ModulePass {
       } else if (Dir == OMPD_taskwait) {
         CGIOMP.emitOMPTaskwait(BBEntry);
       } else if (Dir == OMPD_target) {
+        TargetInfo.ExecMode = OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
         CGIOMP.emitOMPTarget(Fn, BBEntry, StartBB, EndBB, DSAValueMap,
                              StructMappingInfoMap, TargetInfo,
                              /* OMPLoopInfo */ nullptr, IsDeviceTargetRegion);
@@ -321,6 +316,7 @@ struct IntrinsicsOpenMP : public ModulePass {
         CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
                                  /* IsStandalone */ true);
       } else if (Dir == OMPD_target_teams) {
+        TargetInfo.ExecMode = OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
         CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
                                   AfterBB, TargetInfo,
                                   /* OMPLoopInfo */ nullptr,
@@ -340,6 +336,7 @@ struct IntrinsicsOpenMP : public ModulePass {
         CGIOMP.emitOMPTargetExitData(Fn, BBEntry, DSAValueMap,
                                       StructMappingInfoMap);
       } else if (Dir == OMPD_target_teams_distribute) {
+        TargetInfo.ExecMode = OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
         CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
                                  /* IsStandalone */ false);
         CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
@@ -350,6 +347,7 @@ struct IntrinsicsOpenMP : public ModulePass {
                                             OMPLoopInfo, ParRegionInfo,
                                             /* isStandalone */ false);
       } else if (Dir == OMPD_target_teams_distribute_parallel_for) {
+        TargetInfo.ExecMode = OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_SPMD;
         CGIOMP.emitOMPTargetTeamsDistributeParallelFor(
             DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB, BBExit, AfterBB,
             OMPLoopInfo, ParRegionInfo, TargetInfo, StructMappingInfoMap,
