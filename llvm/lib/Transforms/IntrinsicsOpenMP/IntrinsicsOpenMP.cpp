@@ -14,6 +14,7 @@
 #include "llvm-c/Transforms/IntrinsicsOpenMP.h"
 #include "CGIntrinsicsOpenMP.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Frontend/OpenMP/OMP.h.inc"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/Function.h"
@@ -161,6 +162,7 @@ struct IntrinsicsOpenMP : public ModulePass {
                 TargetInfo.NumTeams = TagInputs[0];
                 break;
               case OMPD_teams:
+              case OMPD_teams_distribute:
                 TeamsInfo.NumTeams = TagInputs[0];
                 break;
               case OMPD_target_teams:
@@ -183,6 +185,7 @@ struct IntrinsicsOpenMP : public ModulePass {
                 TargetInfo.ThreadLimit = TagInputs[0];
                 break;
               case OMPD_teams:
+              case OMPD_teams_distribute:
                 TeamsInfo.ThreadLimit = TagInputs[0];
                 break;
               case OMPD_target_teams:
@@ -315,6 +318,11 @@ struct IntrinsicsOpenMP : public ModulePass {
       } else if (Dir == OMPD_distribute) {
         CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
                                  /* IsStandalone */ true);
+      } else if (Dir == OMPD_teams_distribute) {
+        CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,
+                                 /* IsStandalone */ false);
+        CGIOMP.emitOMPTeams(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
+                            EndBB, AfterBB, TeamsInfo);
       } else if (Dir == OMPD_target_teams) {
         TargetInfo.ExecMode = OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
         CGIOMP.emitOMPTargetTeams(DSAValueMap, DL, Fn, BBEntry, StartBB, EndBB,
@@ -353,8 +361,8 @@ struct IntrinsicsOpenMP : public ModulePass {
             OMPLoopInfo, ParRegionInfo, TargetInfo, StructMappingInfoMap,
             IsDeviceTargetRegion);
       } else {
-        LLVM_DEBUG(dbgs() << "Unknown directive " << *CBEntry << "\n");
         assert(false && "Unknown directive");
+        report_fatal_error("Unknown directive");
       }
 
       if (verifyFunction(*Fn, &errs()))

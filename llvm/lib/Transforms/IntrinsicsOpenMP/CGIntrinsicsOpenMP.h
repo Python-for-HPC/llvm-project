@@ -62,6 +62,7 @@ static const DenseMap<StringRef, Directive> StringToDir = {
     {"DIR.OMP.TARGET", OMPD_target},
     {"DIR.OMP.TEAMS", OMPD_teams},
     {"DIR.OMP.DISTRIBUTE", OMPD_distribute},
+    {"DIR.OMP.TEAMS.DISTRIBUTE", OMPD_teams_distribute},
     {"DIR.OMP.TARGET.TEAMS", OMPD_target_teams},
     {"DIR.OMP.TARGET.ENTER.DATA", OMPD_target_enter_data},
     {"DIR.OMP.TARGET.EXIT.DATA", OMPD_target_exit_data},

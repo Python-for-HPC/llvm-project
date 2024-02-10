@@ -127,7 +127,7 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
       CapturedFirstprivate.push_back(V);
     // Treat lastprivate as shared to capture the pointer.
     else if (DSA_SHARED == DSA || DSA_LASTPRIVATE == DSA || DSA_MAP_TO == DSA ||
-             DSA_MAP_STRUCT == DSA)
+             DSA_MAP_STRUCT == DSA || DSA_MAP_TOFROM == DSA)
       CapturedShared.push_back(V);
     else if (DSA_REDUCTION_ADD == DSA)
       Reductions.push_back(V);
@@ -1752,6 +1752,9 @@ void CGIntrinsicsOpenMP::emitOMPCritical(Function *Fn, BasicBlock *BBEntry,
                                          BasicBlock *AfterBB,
                                          BodyGenCallbackTy BodyGenCB,
                                          FinalizeCallbackTy FiniCB) {
+  if (isOpenMPDeviceRuntime())
+    report_fatal_error("Critical regions are not (yet) implemented on device");
+
   const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
   BBEntry->getTerminator()->eraseFromParent();
   // Set the insertion location at the end of the BBEntry.
