@@ -768,9 +768,14 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
       Value *Bitcast =
           OMPBuilder.Builder.CreateBitCast(GEP, CapturedVars[Idx]->getType());
       Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, Bitcast);
-      // TODO: Runtime expects values in Int64 type.
-      Value *Cast= OMPBuilder.Builder.CreateZExtOrBitCast(Load, OMPBuilder.Int64);
-      OutlinedFnArgs.push_back(Cast);
+      // TODO: Runtime expects values in Int64 type, fix with arguments in struct.
+      AllocaInst *TmpInt64 = OMPBuilder.Builder.CreateAlloca(
+          OMPBuilder.Int64, nullptr, "fpriv.byval");
+      Value *Cast =
+          OMPBuilder.Builder.CreateBitCast(TmpInt64, CapturedVars[Idx]->getType());
+      OMPBuilder.Builder.CreateStore(Load, Cast);
+      Value *ConvLoad = OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, TmpInt64);
+      OutlinedFnArgs.push_back(ConvLoad);
 
       continue;
     }
@@ -2269,8 +2274,15 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
             ->isSingleValueType()) {
       Type *VPtrElemTy = CapturedVars[Idx]->getType()->getPointerElementType();
       Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, CapturedVars[Idx]);
-      Value *Cast= OMPBuilder.Builder.CreateZExtOrBitCast(Load, OMPBuilder.Int64);
-      Args.push_back(Cast);
+      // TODO: Runtime expects values in Int64 type, fix with arguments in
+      // struct.
+      AllocaInst *TmpInt64 = OMPBuilder.Builder.CreateAlloca(
+          OMPBuilder.Int64, nullptr, "fpriv.byval");
+      Value *Cast =
+          OMPBuilder.Builder.CreateBitCast(TmpInt64, CapturedVars[Idx]->getType());
+      OMPBuilder.Builder.CreateStore(Load, Cast);
+      Value *ConvLoad = OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, TmpInt64);
+      Args.push_back(ConvLoad);
 
       continue;
     }
