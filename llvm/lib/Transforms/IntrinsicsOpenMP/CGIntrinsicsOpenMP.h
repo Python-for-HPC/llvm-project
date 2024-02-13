@@ -4,6 +4,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 using namespace llvm;
@@ -285,8 +286,8 @@ public:
           &StructMappingInfoMap,
       bool IsDeviceTargetRegion);
 
-  void emitOMPTargetTeams(DSAValueMapTy &DSAValueMap, const DebugLoc &DL,
-                          Function *Fn, BasicBlock *EntryBB,
+  void emitOMPTargetTeams(DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
+                          const DebugLoc &DL, Function *Fn, BasicBlock *EntryBB,
                           BasicBlock *StartBB, BasicBlock *EndBB,
                           BasicBlock *AfterBB, TargetInfoStruct &TargetInfo,
                           OMPLoopInfoStruct *OMPLoopInfo,
@@ -300,12 +301,12 @@ public:
   Twine getDevWrapperFuncPrefix() { return "__omp_offload_numba_"; }
 
   Function *createOutlinedFunction(DSAValueMapTy &DSAValueMap,
-                                   ValueToValueMapTy *VMap,
-                                   Function * OuterFn, BasicBlock *BBEntry,
+                                   ValueToValueMapTy *VMap, Function *OuterFn,
                                    BasicBlock *StartBB, BasicBlock *EndBB,
-                                   BasicBlock *AfterBB,
                                    SmallVectorImpl<llvm::Value *> &CapturedVars,
                                    StringRef Suffix);
+
+  void setDeviceGlobalizedValues(const ArrayRef<Value *> GlobalizedValues);
 
 private:
   void emitOMPParallelDeviceRuntime(DSAValueMapTy &DSAValueMap,
@@ -357,6 +358,7 @@ private:
   Value *createScalarCast(Value *V, Type *DestTy);
   bool isOpenMPDeviceRuntime();
 
+  SmallPtrSet<Value *, 32> DeviceGlobalizedValues;
 };
 
 } // namespace iomp

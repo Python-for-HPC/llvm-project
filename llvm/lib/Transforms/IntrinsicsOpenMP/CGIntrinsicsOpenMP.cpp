@@ -7,6 +7,7 @@
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 
 #define DEBUG_TYPE "intrinsics-openmp"
 
@@ -55,6 +56,11 @@ static CallInst *checkCreateCall(IRBuilderBase &Builder, FunctionCallee &Fn,
 
 } // namespace
 
+void CGIntrinsicsOpenMP::setDeviceGlobalizedValues(const ArrayRef<Value *> GlobalizedValues) {
+  DeviceGlobalizedValues.clear();
+  DeviceGlobalizedValues.insert(GlobalizedValues.begin(), GlobalizedValues.end());
+}
+
 Value *CGIntrinsicsOpenMP::createScalarCast(Value *V, Type *DestTy) {
   Value *Scalar = nullptr;
   assert(V && "Expected non-null value");
@@ -70,9 +76,8 @@ Value *CGIntrinsicsOpenMP::createScalarCast(Value *V, Type *DestTy) {
 }
 
 Function *CGIntrinsicsOpenMP::createOutlinedFunction(
-    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
-    Function *OuterFn, BasicBlock *BBEntry, BasicBlock *StartBB,
-    BasicBlock *EndBB, BasicBlock *AfterBB,
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, Function *OuterFn,
+    BasicBlock *StartBB, BasicBlock *EndBB,
     SmallVectorImpl<Value *> &CapturedVars, StringRef Suffix) {
   SmallVector<Value *, 16> Privates;
   SmallVector<Value *, 16> CapturedShared;
@@ -121,18 +126,28 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     DSAType DSA = DSAValueMap[V].Type;
 
     LLVM_DEBUG(dbgs() << "V " << *V << " from DSAValueMap Type " << DSA << "\n");
-    if (DSA_PRIVATE == DSA)
+    switch (DSA) {
+    case DSA_PRIVATE:
       Privates.push_back(V);
-    else if (DSA_FIRSTPRIVATE == DSA)
+      break;
+    case DSA_FIRSTPRIVATE:
       CapturedFirstprivate.push_back(V);
-    // Treat lastprivate as shared to capture the pointer.
-    else if (DSA_SHARED == DSA || DSA_LASTPRIVATE == DSA || DSA_MAP_TO == DSA ||
-             DSA_MAP_STRUCT == DSA || DSA_MAP_TOFROM == DSA)
+      break;
+    case DSA_SHARED:
+    // Treat as shared to capture the pointer.
+    case DSA_LASTPRIVATE:
+    case DSA_MAP_TO:
+    case DSA_MAP_FROM:
+    case DSA_MAP_TOFROM:
+    case DSA_MAP_STRUCT:
       CapturedShared.push_back(V);
-    else if (DSA_REDUCTION_ADD == DSA)
+      break;
+    case DSA_REDUCTION_ADD:
       Reductions.push_back(V);
-    else
-      llvm_unreachable("Unsupported DSA type");
+      break;
+    default:
+      report_fatal_error("Unexpected DSA type");
+    }
   }
 
   SmallVector<Type *, 16> Params;
@@ -170,6 +185,11 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
   int arg_no = 2;
   for (auto *V : CapturedShared) {
     AI->setName(V->getName() + ".shared");
+    // Insert pointers in device globalized if they correspond to a device
+    // globalized pointer.
+    if(DeviceGlobalizedValues.contains(V))
+      DeviceGlobalizedValues.insert(AI);
+
     OutlinedFn->addParamAttr(arg_no, Attribute::NonNull);
     OutlinedFn->addParamAttr(
         arg_no, Attribute::get(M.getContext(), Attribute::Dereferenceable, 8));
@@ -350,7 +370,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
   CapturedVars.append(CapturedFirstprivate);
   CapturedVars.append(Reductions);
 
-  OMPBuilder.Builder.restoreIP(SavedIP);
+  if (SavedIP.isSet())
+    OMPBuilder.Builder.restoreIP(SavedIP);
 
   return OutlinedFn;
 }
@@ -402,8 +423,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntime(
 
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn =
-      createOutlinedFunction(DSAValueMap, VMap, Fn, BBEntry, StartBB, EndBB,
-                             AfterBB, CapturedVars, ".omp_outlined_parallel");
+      createOutlinedFunction(DSAValueMap, VMap, Fn, StartBB, EndBB,
+                             CapturedVars, ".omp_outlined_parallel");
 
   auto EmitForkCall = [&](InsertPointTy InsertIP) {
     OMPBuilder.Builder.restoreIP(InsertIP);
@@ -528,6 +549,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntime(
     report_fatal_error("Verification of OuterFn failed!");
 }
 
+#if 0
 void CGIntrinsicsOpenMP::emitOMPParallelHostRuntimeOMPIRBuilder(
     DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
     const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
@@ -680,6 +702,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntimeOMPIRBuilder(
   LLVM_DEBUG(dbgs() << "=== Finalize Fn\n"
                     << *Fn << "=== End of Finalize Fn\n");
 }
+#endif
 
 void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
     DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
@@ -689,10 +712,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
   // Extract parallel region
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn =
-      createOutlinedFunction(DSAValueMap, VMap, Fn, BBEntry, StartBB, EndBB, AfterBB,
+      createOutlinedFunction(DSAValueMap, VMap, Fn, StartBB, EndBB,
                              CapturedVars, ".omp_outlined_parallel");
-  // TODO: remove
-  //OutlinedFn->addFnAttr(Attribute::NoInline);
 
   // Create wrapper for worker threads
   SmallVector<Type *, 2> Params;
@@ -796,6 +817,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
   Value *CapturedVarsAddrs = OMPBuilder.Builder.CreateAlloca(
       CapturedVarsAddrsTy, nullptr, "captured_var_addrs");
 
+  SmallVector<Value *> GlobalAllocas;
   for (size_t Idx = 0; Idx < CapturedVars.size(); ++Idx) {
     LLVM_DEBUG(dbgs() << "CapturedVar " << Idx << " " << *CapturedVars[Idx]
                       << "\n");
@@ -819,9 +841,35 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
       continue;
     }
 
-    Value *Bitcast =
-        OMPBuilder.Builder.CreateBitCast(CapturedVars[Idx], OMPBuilder.Int8Ptr);
-    OMPBuilder.Builder.CreateStore(Bitcast, GEP);
+    // Allocate from global memory if the pointer is not globalized (not in the
+    // global address space).
+    FunctionCallee KmpcAllocShared =
+        OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_alloc_shared);
+    assert(CapturedVars[Idx]->getType()->isPointerTy() &&
+           "Expected pointer type");
+
+    if (DeviceGlobalizedValues.contains(CapturedVars[Idx])) {
+      Value *Bitcast = OMPBuilder.Builder.CreateBitCast(CapturedVars[Idx],
+                                                        OMPBuilder.Int8Ptr);
+      OMPBuilder.Builder.CreateStore(Bitcast, GEP);
+    } else {
+      Type *AllocTy = CapturedVars[Idx]->getType()->getPointerElementType();
+      Value *Size = ConstantInt::get(OMPBuilder.SizeTy,
+                            M.getDataLayout().getTypeAllocSize(AllocTy));
+      CallBase *GlobalAlloc =
+          OMPBuilder.Builder.CreateCall(KmpcAllocShared, {Size});
+      GlobalAlloc->addRetAttr(
+          llvm::Attribute::get(M.getContext(), llvm::Attribute::Alignment, 16));
+      GlobalAllocas.push_back(GlobalAlloc);
+      // TODO: this assumes the type is trivally copyable, use the copy
+      // constructor for more complex types.
+      OMPBuilder.Builder.CreateMemCpy(
+          GlobalAlloc, GlobalAlloc->getPointerAlignment(M.getDataLayout()),
+          CapturedVars[Idx],
+          CapturedVars[Idx]->getPointerAlignment(M.getDataLayout()), Size);
+
+      OMPBuilder.Builder.CreateStore(GlobalAlloc, GEP);
+    }
   }
 
   Value *Ident = OMPBuilder.getOrCreateIdent(SrcLocStr, SrcLocStrSize);
@@ -873,6 +921,17 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
 
   assert(checkCreateCall(OMPBuilder.Builder, KmpcParallel51, Args) &&
          "Expected non-null call instr from code generation");
+
+  FunctionCallee KmpcFreeShared =
+      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_free_shared);
+  for (Value *GA : GlobalAllocas) {
+    Type *AllocTy = GA->getType()->getPointerElementType();
+    Value *Size = ConstantInt::get(OMPBuilder.SizeTy,
+                                   M.getDataLayout().getTypeAllocSize(AllocTy));
+    assert(checkCreateCall(OMPBuilder.Builder, KmpcFreeShared, {GA, Size}) &&
+           "Expected valid call");
+  }
+
   OMPBuilder.Builder.CreateBr(AfterBB);
 
   LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
@@ -2110,9 +2169,10 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
   for (auto &Arg : NumbaWrapperFunc->args())
     DevFuncArgs.push_back(&Arg);
 
+  bool IsSPMD = (TargetInfo.ExecMode == omp::OMP_TGT_EXEC_MODE_SPMD);
   if (isOpenMPDeviceRuntime()) {
     OpenMPIRBuilder::LocationDescription Loc(Builder);
-    auto IP = OMPBuilder.createTargetInit(Loc, /* IsSPMD */ false,
+    auto IP = OMPBuilder.createTargetInit(Loc, /* IsSPMD */ IsSPMD,
                                           /* RequiresFullRuntime */ true);
     Builder.restoreIP(IP);
   }
@@ -2121,7 +2181,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
 
   if (isOpenMPDeviceRuntime()) {
     OpenMPIRBuilder::LocationDescription Loc(Builder);
-    OMPBuilder.createTargetDeinit(Loc, /* IsSPMD */ false,
+    OMPBuilder.createTargetDeinit(Loc, /* IsSPMD */ IsSPMD,
                                   /* RequiresFullRuntime */ true);
   }
 
@@ -2169,10 +2229,8 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
     BasicBlock *EndBB, BasicBlock *AfterBB, TeamsInfoStruct &TeamsInfo) {
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn =
-      createOutlinedFunction(DSAValueMap, VMap, Fn, BBEntry, StartBB, EndBB,
-                             AfterBB, CapturedVars, ".omp_outlined_teams");
-  // TODO: remove
-  //OutlinedFn->addFnAttr(Attribute::NoInline);
+      createOutlinedFunction(DSAValueMap, VMap, Fn, StartBB, EndBB,
+                             CapturedVars, ".omp_outlined_teams");
 
   // Set up the call to the teams outlined function.
   BBEntry->getTerminator()->eraseFromParent();
@@ -2203,7 +2261,7 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
   Args.append({ThreadIDAddr, ZeroAddr});
 
   for (size_t Idx = 0; Idx < CapturedVars.size(); ++Idx) {
-      // Pass firstprivate scalar by value.
+    // Pass firstprivate scalar by value.
     if (DSAValueMap[CapturedVars[Idx]].Type == DSA_FIRSTPRIVATE &&
         CapturedVars[Idx]
             ->getType()
@@ -2238,10 +2296,10 @@ void CGIntrinsicsOpenMP::emitOMPTeams(DSAValueMapTy &DSAValueMap,
                                       BasicBlock *EndBB, BasicBlock *AfterBB,
                                       TeamsInfoStruct &TeamsInfo) {
   if (isOpenMPDeviceRuntime())
-    emitOMPTeamsDeviceRuntime(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
+    emitOMPTeamsDeviceRuntime(DSAValueMap, VMap, DL, Fn, BBEntry, StartBB,
                               EndBB, AfterBB, TeamsInfo);
   else
-    emitOMPTeamsHostRuntime(DSAValueMap, nullptr, DL, Fn, BBEntry, StartBB,
+    emitOMPTeamsHostRuntime(DSAValueMap, VMap, DL, Fn, BBEntry, StartBB,
                             EndBB, AfterBB, TeamsInfo);
 }
 
@@ -2253,10 +2311,8 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
                                       TeamsInfoStruct &TeamsInfo) {
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn = createOutlinedFunction(
-      DSAValueMap, /*ValueToValueMapTy */ VMap, Fn, BBEntry, StartBB, EndBB,
-      AfterBB, CapturedVars, ".omp_outlined_teams");
-  // TODO: remove
-  //OutlinedFn->addFnAttr(Attribute::NoInline);
+      DSAValueMap, /*ValueToValueMapTy */ VMap, Fn, StartBB, EndBB,
+      CapturedVars, ".omp_outlined_teams");
 
   // Set up the call to the teams outlined function.
   BBEntry->getTerminator()->eraseFromParent();
@@ -2843,7 +2899,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
                                ParRegionInfo,
                                /* isStandalone */ false);
   // Lower target_teams.
-  emitOMPTargetTeams(DSAValueMap, DL, Fn, EntryBB, StartBB, EndBB, AfterBB,
+  emitOMPTargetTeams(DSAValueMap, nullptr, DL, Fn, EntryBB, StartBB, EndBB, AfterBB,
                      TargetInfo, &OMPLoopInfo, StructMappingInfoMap,
                      IsDeviceTargetRegion);
 
@@ -2852,22 +2908,16 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
 #if 0
   ValueToValueMapTy VMap;
   // Lower target_teams.
-  if (IsDeviceTargetRegion) {
-    emitOMPTeamsDevice(DSAValueMap, &VMap, DL, Fn, EntryBB, StartBB, EndBB, AfterBB);
+  emitOMPTargetTeams(DSAValueMap, &VMap, DL, Fn, EntryBB, StartBB, EndBB, AfterBB,
+                     TargetInfo, &OMPLoopInfo, StructMappingInfoMap,
+                     IsDeviceTargetRegion);
 
-    for(auto VV : VMap) {
-      dbgs() << "VMap " << *VV.first << " => " << *VV.second << "\n";
-    }
-    emitOMPTargetDevice(Fn, DSAValueMap);
-  } else {
-    emitOMPTeams(DSAValueMap, &VMap, DL, Fn, EntryBB, StartBB, EndBB, AfterBB,
-                 TargetInfo.NumTeams, TargetInfo.ThreadLimit);
-    StartBB = SplitBlock(EntryBB, &*EntryBB->getFirstInsertionPt());
-    EndBB = AfterBB;
-    emitOMPTarget(TargetInfo.DevFuncName, TargetInfo.ELF, Fn, EntryBB, StartBB,
-                  EndBB, DSAValueMap, StructMappingInfoMap, TargetInfo.NumTeams,
-                  TargetInfo.ThreadLimit);
+  dbgs() << "=== VMap\n";
+  for(auto VV : VMap) {
+    dbgs() << "V " << *VV.first << " -> " << *VV.second << "\n";
   }
+  dbgs() << "=== End of VMap\n";
+  getchar();
 
   // Update DSAValueMap
   SmallVector<Value *, 8> ToDelete;
@@ -2877,7 +2927,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
       continue;
 
     DSAValueMap[VMap[V]] = It.second;
-    dbgs() << "Update DSAValueMap " << *VMap[V] << " ~> " << It.second << "\n";
+    dbgs() << "Update DSAValueMap " << *VMap[V] << " ~> " << It.second.Type << "\n";
     ToDelete.push_back(V);
   }
   for(auto *V : ToDelete) {
@@ -2892,12 +2942,13 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
   OMPLoopInfo.UB = VMap[OMPLoopInfo.UB];
 
   emitOMPDistributeParallelFor(DSAValueMap, StartBB, ExitBB, OMPLoopInfo,
+                               ParRegionInfo,
                                /* isStandalone */ false);
 #endif
 }
 
 void CGIntrinsicsOpenMP::emitOMPTargetTeams(
-    DSAValueMapTy &DSAValueMap, const DebugLoc &DL, Function *Fn,
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL, Function *Fn,
     BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     BasicBlock *AfterBB, TargetInfoStruct &TargetInfo,
     OMPLoopInfoStruct *OMPLoopInfo,
@@ -2912,11 +2963,11 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeams(
   BasicBlock *TeamsEndBB =
       splitBlockBefore(EndBB, &*EndBB->getFirstInsertionPt(), nullptr, nullptr,
                        nullptr, "omp.teams.end");
-  // TargetInfo contains teams informations.
+  // TargetInfo contains teams info.
   TeamsInfoStruct TeamsInfo;
   TeamsInfo.NumTeams = TargetInfo.NumTeams;
   TeamsInfo.ThreadLimit = TargetInfo.ThreadLimit;
-  emitOMPTeams(DSAValueMap, nullptr, DL, Fn, TeamsEntryBB, TeamsStartBB,
+  emitOMPTeams(DSAValueMap, VMap, DL, Fn, TeamsEntryBB, TeamsStartBB,
                TeamsEndBB, EndBB, TeamsInfo);
 
   emitOMPTarget(Fn, EntryBB, TeamsEntryBB, EndBB, DSAValueMap,
