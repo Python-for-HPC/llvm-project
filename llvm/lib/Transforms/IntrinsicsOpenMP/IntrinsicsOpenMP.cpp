@@ -243,6 +243,7 @@ struct IntrinsicsOpenMP : public ModulePass {
     for (auto &DirectiveList: DirectiveListVector) {
       // If the outermost directive is a TARGET directive, collect globalized
       // values to set for codegen.
+      // TODO: implement Directives as a class, parse each directive before codegen.
       auto *Outer = DirectiveList.front();
       if (Outer->getEntry()->getOperandBundleAt(0).getTagName().contains(
               "TARGET")) {
@@ -507,6 +508,12 @@ struct IntrinsicsOpenMP : public ModulePass {
                                     StartBB, EndBB, AfterBB, TargetInfo,
                                     /* OMPLoopInfo */ nullptr,
                                     StructMappingInfoMap, IsDeviceTargetRegion);
+        } else if (Dir == OMPD_target_data) {
+          if (IsDeviceTargetRegion)
+            report_fatal_error("Target enter data should never appear inside a "
+                               "device target region");
+          CGIOMP.emitOMPTargetData(Fn, BBEntry, BBExit, DSAValueMap,
+                                        StructMappingInfoMap);
         } else if (Dir == OMPD_target_enter_data) {
           if (IsDeviceTargetRegion)
             report_fatal_error("Target enter data should never appear inside a "
@@ -521,6 +528,13 @@ struct IntrinsicsOpenMP : public ModulePass {
 
           CGIOMP.emitOMPTargetExitData(Fn, BBEntry, DSAValueMap,
                                        StructMappingInfoMap);
+        } else if (Dir == OMPD_target_update) {
+          if (IsDeviceTargetRegion)
+            report_fatal_error("Target exit data should never appear inside a "
+                               "device target region");
+
+          CGIOMP.emitOMPTargetUpdate(Fn, BBEntry, DSAValueMap,
+                                     StructMappingInfoMap);
         } else if (Dir == OMPD_target_teams_distribute) {
           TargetInfo.ExecMode = OMPTgtExecModeFlags::OMP_TGT_EXEC_MODE_GENERIC;
           CGIOMP.emitOMPDistribute(DSAValueMap, StartBB, BBExit, OMPLoopInfo,

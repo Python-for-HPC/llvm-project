@@ -959,6 +959,19 @@ FunctionCallee CGIntrinsicsOpenMP::getKmpcForStaticInit(Type *Ty) {
   llvm_unreachable("unknown OpenMP loop iterator bitwidth");
 }
 
+FunctionCallee CGIntrinsicsOpenMP::getKmpcDistributeStaticInit(Type *Ty) {
+  LLVM_DEBUG(dbgs() << "Type " << *Ty << "\n");
+  unsigned Bitwidth = Ty->getIntegerBitWidth();
+  LLVM_DEBUG(dbgs() << "Bitwidth " << Bitwidth << "\n");
+  if (Bitwidth == 32)
+    return OMPBuilder.getOrCreateRuntimeFunction(
+        M, OMPRTL___kmpc_distribute_static_init_4u);
+  if (Bitwidth == 64)
+    return OMPBuilder.getOrCreateRuntimeFunction(
+        M, OMPRTL___kmpc_distribute_static_init_8u);
+  llvm_unreachable("unknown OpenMP loop iterator bitwidth");
+}
+
 void CGIntrinsicsOpenMP::emitOMPFor(DSAValueMapTy &DSAValueMap,
                                     OMPLoopInfoStruct &OMPLoopInfo,
                                     BasicBlock *StartBB, BasicBlock *ExitBB,
@@ -1515,7 +1528,7 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingEntry(const Twine &DevFuncName,
 
 void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
     InsertPointTy AllocaIP, DSAValueMapTy &DSAValueMap,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+    StructMapTy &StructMappingInfoMap,
     OffloadingMappingArgsTy &OffloadingMappingArgs, bool IsTargetRegion) {
 
   struct MapperInfo {
@@ -1530,6 +1543,7 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
   SmallVector<Constant *, 8> OffloadMapNames;
 
   if (DSAValueMap.empty()) {
+    OffloadingMappingArgs.Size = 0;
     OffloadingMappingArgs.BasePtrs =
         Constant::getNullValue(OMPBuilder.VoidPtrPtr);
     OffloadingMappingArgs.Ptrs = Constant::getNullValue(OMPBuilder.VoidPtrPtr);
@@ -2033,7 +2047,7 @@ CGIntrinsicsOpenMP::emitOffloadingGlobals(StringRef DevWrapperFuncName,
 void CGIntrinsicsOpenMP::emitOMPTarget(
     Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     DSAValueMapTy &DSAValueMap,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+    StructMapTy &StructMappingInfoMap,
     TargetInfoStruct &TargetInfo, OMPLoopInfoStruct *OMPLoopInfo,
     bool IsDeviceTargetRegion) {
   if (IsDeviceTargetRegion)
@@ -2047,7 +2061,7 @@ void CGIntrinsicsOpenMP::emitOMPTarget(
 void CGIntrinsicsOpenMP::emitOMPTargetHost(
     Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     DSAValueMapTy &DSAValueMap,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+    StructMapTy &StructMappingInfoMap,
     TargetInfoStruct &TargetInfo, OMPLoopInfoStruct *OMPLoopInfo) {
 
   Twine DevWrapperFuncName = getDevWrapperFuncPrefix() + TargetInfo.DevFuncName;
@@ -2121,7 +2135,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
 void CGIntrinsicsOpenMP::emitOMPTargetDevice(
     Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     DSAValueMapTy &DSAValueMap,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+    StructMapTy &StructMappingInfoMap,
     TargetInfoStruct &TargetInfo) {
   // Emit the Numba wrapper offloading function.
   SmallVector<Type *, 8> WrapperArgsTypes;
@@ -2395,7 +2409,7 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
 
 void CGIntrinsicsOpenMP::emitOMPTargetEnterData(
     Function *Fn, BasicBlock *BBEntry, DSAValueMapTy &DSAValueMap,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
+    StructMapTy
         &StructMappingInfoMap) {
 
   const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
@@ -2430,7 +2444,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetEnterData(
 
 void CGIntrinsicsOpenMP::emitOMPTargetExitData(
     Function *Fn, BasicBlock *BBEntry, DSAValueMapTy &DSAValueMap,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>>
+    StructMapTy
         &StructMappingInfoMap) {
 
   const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
@@ -2454,6 +2468,48 @@ void CGIntrinsicsOpenMP::emitOMPTargetExitData(
 
   OMPBuilder.Builder.CreateCall(
       TargetDataEndMapper,
+      {SrcLoc, ConstantInt::get(OMPBuilder.Int64, -1),
+       ConstantInt::get(OMPBuilder.Int32, OffloadingMappingArgs.Size),
+       OffloadingMappingArgs.BasePtrs, OffloadingMappingArgs.Ptrs,
+       OffloadingMappingArgs.Sizes, OffloadingMappingArgs.MapTypes,
+       OffloadingMappingArgs.MapNames,
+       // TODO: offload_mappers is null for now.
+       Constant::getNullValue(OMPBuilder.VoidPtrPtr)});
+}
+
+void CGIntrinsicsOpenMP::emitOMPTargetData(Function *Fn, BasicBlock *BBEntry,
+                                           BasicBlock *BBExit,
+                                           DSAValueMapTy &DSAValueMap,
+                                           StructMapTy &StructMappingInfoMap) {
+  // Re-use codegen from TARGET ENTER/EXIT DATA.
+  emitOMPTargetEnterData(Fn, BBEntry, DSAValueMap, StructMappingInfoMap);
+  emitOMPTargetExitData(Fn, BBExit, DSAValueMap, StructMappingInfoMap);
+}
+
+void CGIntrinsicsOpenMP::emitOMPTargetUpdate(
+    Function *Fn, BasicBlock *BBEntry, DSAValueMapTy &DSAValueMap,
+    StructMapTy &StructMappingInfoMap) {
+  const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
+  OpenMPIRBuilder::LocationDescription Loc(
+      InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()), DL);
+
+  uint32_t SrcLocStrSize;
+  Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc, SrcLocStrSize);
+  Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr, SrcLocStrSize);
+
+  FunctionCallee TargetDataUpdateMapper = OMPBuilder.getOrCreateRuntimeFunction(
+      M, OMPRTL___tgt_target_data_update_mapper);
+  OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
+
+  // Emit mappings.
+  OffloadingMappingArgsTy OffloadingMappingArgs;
+  InsertPointTy AllocaIP(&Fn->getEntryBlock(),
+                         Fn->getEntryBlock().getFirstInsertionPt());
+  emitOMPOffloadingMappings(AllocaIP, DSAValueMap, StructMappingInfoMap,
+                            OffloadingMappingArgs, /* IsTargetRegion */ false);
+
+  OMPBuilder.Builder.CreateCall(
+      TargetDataUpdateMapper,
       {SrcLoc, ConstantInt::get(OMPBuilder.Int64, -1),
        ConstantInt::get(OMPBuilder.Int32, OffloadingMappingArgs.Size),
        OffloadingMappingArgs.BasePtrs, OffloadingMappingArgs.Ptrs,
@@ -2643,9 +2699,14 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
   Type *IVTy = OMPLoopInfo.IV->getType()->getPointerElementType();
   Function *Fn = PreHeader->getParent();
 
-  FunctionCallee KmpcForStaticInit = getKmpcForStaticInit(IVTy);
-  FunctionCallee KmpcForStaticFini =
-      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_for_static_fini);
+  FunctionCallee KmpcDistributeStaticInit =
+      (isOpenMPDeviceRuntime() ? getKmpcDistributeStaticInit(IVTy)
+                               : getKmpcForStaticInit(IVTy));
+  FunctionCallee KmpcDistributeStaticFini =
+      (isOpenMPDeviceRuntime() ? OMPBuilder.getOrCreateRuntimeFunction(
+                                     M, OMPRTL___kmpc_distribute_static_fini)
+                               : OMPBuilder.getOrCreateRuntimeFunction(
+                                     M, OMPRTL___kmpc_for_static_fini));
 
   const DebugLoc DL = PreHeader->getTerminator()->getDebugLoc();
   OpenMPIRBuilder::LocationDescription Loc(
@@ -2764,8 +2825,18 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
 
   // If Chunk is not specified (nullptr), default to one, complying with the
   // OpenMP specification.
-  if (!OMPLoopInfo.Chunk)
-    OMPLoopInfo.Chunk = One;
+  if (!OMPLoopInfo.Chunk) {
+    if (isOpenMPDeviceRuntime()) {
+      FunctionCallee NumTeamThreadsFn = OMPBuilder.getOrCreateRuntimeFunction(
+          M, llvm::omp::RuntimeFunction::
+                 OMPRTL___kmpc_get_hardware_num_threads_in_block);
+      Value *NumTeamThreads =
+          OMPBuilder.Builder.CreateCall(NumTeamThreadsFn, {});
+      OMPLoopInfo.Chunk = NumTeamThreads;
+    } else {
+      OMPLoopInfo.Chunk = One;
+    }
+  }
   Value *ChunkCast =
       OMPBuilder.Builder.CreateIntCast(OMPLoopInfo.Chunk, IVTy, /*isSigned*/ false);
 
@@ -2781,9 +2852,10 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
   LLVM_DEBUG(dbgs() << "=== PStride " << *PStride << "\n");
   LLVM_DEBUG(dbgs() << "=== Incr " << *One << "\n");
   LLVM_DEBUG(dbgs() << "=== ChunkCast " << *ChunkCast << "\n");
-  OMPBuilder.Builder.CreateCall(
-      KmpcForStaticInit, {SrcLoc, ThreadNum, SchedulingType, PLastIter,
-                          PLowerBound, PUpperBound, PStride, One, ChunkCast});
+  OMPBuilder.Builder.CreateCall(KmpcDistributeStaticInit,
+                                {SrcLoc, ThreadNum, SchedulingType, PLastIter,
+                                 PLowerBound, PUpperBound, PStride, One,
+                                 ChunkCast});
 
   LoadUB = OMPBuilder.Builder.CreateLoad(IVTy, PUpperBound);
   Value *LoadGlobalUB = OMPBuilder.Builder.CreateLoad(IVTy, OMPLoopInfo.UB);
@@ -2818,7 +2890,7 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
 
   // Emit Exit block for the distribute outer loop.
   OMPBuilder.Builder.SetInsertPoint(DistributeExit->getTerminator());
-  OMPBuilder.Builder.CreateCall(KmpcForStaticFini, {SrcLoc, ThreadNum});
+  OMPBuilder.Builder.CreateCall(KmpcDistributeStaticFini, {SrcLoc, ThreadNum});
 
   LLVM_DEBUG(dbgs() << "=== Dump Distribute DistributeParallelFor\n"
                     << *PreHeader->getParent()
@@ -2905,7 +2977,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
     BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     BasicBlock *ExitBB, BasicBlock *AfterBB, OMPLoopInfoStruct &OMPLoopInfo,
     ParRegionInfoStruct &ParRegionInfo, TargetInfoStruct &TargetInfo,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+    StructMapTy &StructMappingInfoMap,
     bool IsDeviceTargetRegion) {
   emitOMPDistributeParallelFor(DSAValueMap, StartBB, ExitBB, OMPLoopInfo,
                                ParRegionInfo,
@@ -2964,7 +3036,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeams(
     BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     BasicBlock *AfterBB, TargetInfoStruct &TargetInfo,
     OMPLoopInfoStruct *OMPLoopInfo,
-    MapVector<Value *, SmallVector<FieldMappingInfo, 4>> &StructMappingInfoMap,
+    StructMapTy &StructMappingInfoMap,
     bool IsDeviceTargetRegion) {
 
   BasicBlock *TeamsEntryBB = SplitBlock(EntryBB, EntryBB->getTerminator());
