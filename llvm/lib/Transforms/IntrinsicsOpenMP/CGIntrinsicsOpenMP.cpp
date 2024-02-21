@@ -2079,10 +2079,13 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
 
   // TODO: should we use target_mapper without teams or the more general
   // target_teams_mapper. Does the former buy us anything (less overhead?)
-  //FunctionCallee TargetMapper =
+  // FunctionCallee TargetMapper =
   //    OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_mapper);
   FunctionCallee TargetMapper =
-      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_teams_mapper);
+      (TargetInfo.NoWait ? OMPBuilder.getOrCreateRuntimeFunction(
+                               M, OMPRTL___tgt_target_teams_nowait_mapper)
+                         : OMPBuilder.getOrCreateRuntimeFunction(
+                               M, OMPRTL___tgt_target_teams_mapper));
   OMPBuilder.Builder.SetInsertPoint(EntryBB->getTerminator());
 
   // Emit mappings.
@@ -2124,6 +2127,14 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
       OffloadingMappingArgs.MapNames,
       // TODO: offload_mappers is null for now.
       Constant::getNullValue(OMPBuilder.VoidPtrPtr), NumTeams, ThreadLimit};
+
+  if (TargetInfo.NoWait) {
+    // Add extra dependency information (unused for now).
+    Args.push_back(Constant::getNullValue(OMPBuilder.Int32));
+    Args.push_back(Constant::getNullValue(OMPBuilder.Int8Ptr));
+    Args.push_back(Constant::getNullValue(OMPBuilder.Int32));
+    Args.push_back(Constant::getNullValue(OMPBuilder.Int8Ptr));
+  }
 
   auto *OffloadResult = checkCreateCall(OMPBuilder.Builder, TargetMapper, Args);
   assert(OffloadResult && "Expected non-null call inst from code generation");

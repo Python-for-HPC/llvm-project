@@ -262,6 +262,7 @@ struct IntrinsicsOpenMP : public ModulePass {
         SmallVector<OperandBundleDef, 16> OpBundles;
         DSAValueMapTy DSAValueMap;
 
+        // RAII for directive metainfo structs.
         OMPLoopInfoStruct OMPLoopInfo;
         ParRegionInfoStruct ParRegionInfo;
         TargetInfoStruct TargetInfo;
@@ -384,6 +385,17 @@ struct IntrinsicsOpenMP : public ModulePass {
               default:
                 // report_fatal_error("Unsupported qualifier in directive");
                 assert(false && "Unsupported qualifier in directive");
+              }
+            } else if (Tag.startswith("QUAL.OMP.NOWAIT")) {
+              switch(Dir) {
+                case OMPD_target:
+                case OMPD_target_teams:
+                case OMPD_target_teams_distribute:
+                case OMPD_target_teams_distribute_parallel_for:
+                  TargetInfo.NoWait = true;
+                  break;
+                default:
+                  assert(false && "Unsupported nowait qualifier in directive");
               }
             } else /* DSA Qualifiers */ {
               auto It = StringToDSA.find(Tag);

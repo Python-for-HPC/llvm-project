@@ -161,6 +161,7 @@ struct TargetInfoStruct {
   Value *NumTeams = nullptr;
   Value *ThreadLimit = nullptr;
   OMPTgtExecModeFlags ExecMode = (OMPTgtExecModeFlags)0;
+  bool NoWait = false;
 };
 
 struct ParRegionInfoStruct {
