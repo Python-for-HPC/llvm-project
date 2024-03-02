@@ -2081,6 +2081,8 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
   // target_teams_mapper. Does the former buy us anything (less overhead?)
   // FunctionCallee TargetMapper =
   //    OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_mapper);
+  // TODO: For nowait we need to enclose the host code in a task for async
+  // execution.
   FunctionCallee TargetMapper =
       (TargetInfo.NoWait ? OMPBuilder.getOrCreateRuntimeFunction(
                                M, OMPRTL___tgt_target_teams_nowait_mapper)
