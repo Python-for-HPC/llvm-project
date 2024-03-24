@@ -1,4 +1,5 @@
 #include "CGIntrinsicsOpenMP.h"
+#include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Debug.h"
@@ -6,7 +7,6 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
-#include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 #define DEBUG_TYPE "intrinsics-openmp"
@@ -56,9 +56,11 @@ static CallInst *checkCreateCall(IRBuilderBase &Builder, FunctionCallee &Fn,
 
 } // namespace
 
-void CGIntrinsicsOpenMP::setDeviceGlobalizedValues(const ArrayRef<Value *> GlobalizedValues) {
+void CGIntrinsicsOpenMP::setDeviceGlobalizedValues(
+    const ArrayRef<Value *> GlobalizedValues) {
   DeviceGlobalizedValues.clear();
-  DeviceGlobalizedValues.insert(GlobalizedValues.begin(), GlobalizedValues.end());
+  DeviceGlobalizedValues.insert(GlobalizedValues.begin(),
+                                GlobalizedValues.end());
 }
 
 Value *CGIntrinsicsOpenMP::createScalarCast(Value *V, Type *DestTy) {
@@ -116,7 +118,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
   // correspond to Numba-generated temporaries that should be privatized.
   for (auto *V : Inputs) {
     if (!DSAValueMap.count(V)) {
-      LLVM_DEBUG(dbgs() << "Missing V " << *V << " from DSAValueMap, will privatize\n");
+      LLVM_DEBUG(dbgs() << "Missing V " << *V
+                        << " from DSAValueMap, will privatize\n");
       assert(V->getName().startswith(".") &&
              "Expected Numba temporary value, named starting with .");
       Privates.push_back(V);
@@ -125,7 +128,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
 
     DSAType DSA = DSAValueMap[V].Type;
 
-    LLVM_DEBUG(dbgs() << "V " << *V << " from DSAValueMap Type " << DSA << "\n");
+    LLVM_DEBUG(dbgs() << "V " << *V << " from DSAValueMap Type " << DSA
+                      << "\n");
     switch (DSA) {
     case DSA_PRIVATE:
       Privates.push_back(V);
@@ -187,7 +191,7 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     AI->setName(V->getName() + ".shared");
     // Insert pointers in device globalized if they correspond to a device
     // globalized pointer.
-    if(DeviceGlobalizedValues.contains(V))
+    if (DeviceGlobalizedValues.contains(V))
       DeviceGlobalizedValues.insert(AI);
 
     OutlinedFn->addParamAttr(arg_no, Attribute::NonNull);
@@ -211,7 +215,7 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     ++arg_no;
   }
   for (auto *V : Reductions) {
-   AI->setName(V->getName() + ".red");
+    AI->setName(V->getName() + ".red");
     OutlinedFn->addParamAttr(arg_no, Attribute::NonNull);
     OutlinedFn->addParamAttr(
         arg_no, Attribute::get(M.getContext(), Attribute::Dereferenceable, 8));
@@ -280,8 +284,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     CollectUses(V, Uses);
 
     Type *VPtrElemTy = V->getType()->getPointerElementType();
-    Value *ReplacementValue =
-        OMPBuilder.Builder.CreateAlloca(VPtrElemTy, nullptr, V->getName() + ".copy");
+    Value *ReplacementValue = OMPBuilder.Builder.CreateAlloca(
+        VPtrElemTy, nullptr, V->getName() + ".copy");
     if (VPtrElemTy->isSingleValueType()) {
       // TODO: The OpenMP runtime expects and propagates arguments
       // typed as Int64, thus we cast byval firstprivates to Int64. Using an
@@ -292,16 +296,14 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
       Value *BitCast = OMPBuilder.Builder.CreateBitCast(Alloca, V->getType());
       Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, BitCast);
       OMPBuilder.Builder.CreateStore(Load, ReplacementValue);
-    }
-    else {
-      Value *Load =
-          OMPBuilder.Builder.CreateLoad(VPtrElemTy, AI, V->getName() + ".reload");
+    } else {
+      Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, AI,
+                                                  V->getName() + ".reload");
       FunctionCallee CopyConstructor = DSAValueMap[V].CopyConstructor;
       if (CopyConstructor) {
         Value *Copy = OMPBuilder.Builder.CreateCall(CopyConstructor, {Load});
         OMPBuilder.Builder.CreateStore(Copy, ReplacementValue);
-      }
-      else
+      } else
         OMPBuilder.Builder.CreateStore(Load, ReplacementValue);
     }
 
@@ -339,8 +341,7 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
       ReductionInfos.push_back({VTy, AI, Priv, CGReduction::sumReduction,
                                 CGReduction::sumAtomicReduction});
       ReplaceUses(Uses, Priv);
-    }
-    else
+    } else
       llvm_unreachable("Unsupported reduction");
 
     ++AI;
@@ -390,9 +391,9 @@ CGIntrinsicsOpenMP::CGIntrinsicsOpenMP(Module &M) : OMPBuilder(M), M(M) {
 }
 
 void CGIntrinsicsOpenMP::emitOMPParallel(
-    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
-    const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
-    BasicBlock *EndBB, BasicBlock *AfterBB, FinalizeCallbackTy FiniCB,
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL,
+    Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+    BasicBlock *AfterBB, FinalizeCallbackTy FiniCB,
     ParRegionInfoStruct &ParRegionInfo) {
   if (isOpenMPDeviceRuntime())
     emitOMPParallelDeviceRuntime(DSAValueMap, VMap, DL, Fn, BBEntry, StartBB,
@@ -403,9 +404,9 @@ void CGIntrinsicsOpenMP::emitOMPParallel(
 }
 
 void CGIntrinsicsOpenMP::emitOMPParallelHostRuntime(
-    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
-    const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
-    BasicBlock *EndBB, BasicBlock *AfterBB, FinalizeCallbackTy FiniCB,
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL,
+    Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+    BasicBlock *AfterBB, FinalizeCallbackTy FiniCB,
     ParRegionInfoStruct &ParRegionInfo) {
 
   // Set the insertion location at the end of the BBEntry.
@@ -478,7 +479,7 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntime(
     OMPBuilder.Builder.CreateStore(Constant::getNullValue(OMPBuilder.Int32),
                                    ZeroAddr);
     // Zero for thread id, bound tid.
-    SmallVector<Value *, 16> OutlinedArgs = { ZeroAddr, ZeroAddr };
+    SmallVector<Value *, 16> OutlinedArgs = {ZeroAddr, ZeroAddr};
     for (size_t Idx = 0; Idx < CapturedVars.size(); ++Idx) {
       // Pass firstprivate scalar by value.
       if (DSAValueMap[CapturedVars[Idx]].Type == DSA_FIRSTPRIVATE &&
@@ -543,7 +544,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntime(
         InsertPointTy(BBEntry, BBEntry->getTerminator()->getIterator()));
   }
 
-  LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n" << *Fn << "=== End of Dump OuterFn\n");
+  LLVM_DEBUG(dbgs() << "=== Dump OuterFn\n"
+                    << *Fn << "=== End of Dump OuterFn\n");
 
   if (verifyFunction(*Fn, &errs()))
     report_fatal_error("Verification of OuterFn failed!");
@@ -705,9 +707,9 @@ void CGIntrinsicsOpenMP::emitOMPParallelHostRuntimeOMPIRBuilder(
 #endif
 
 void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
-    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
-    const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
-    BasicBlock *EndBB, BasicBlock *AfterBB, FinalizeCallbackTy FiniCB,
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL,
+    Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+    BasicBlock *AfterBB, FinalizeCallbackTy FiniCB,
     ParRegionInfoStruct &ParRegionInfo) {
   // Extract parallel region
   SmallVector<Value *, 16> CapturedVars;
@@ -768,13 +770,15 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
       Value *Bitcast =
           OMPBuilder.Builder.CreateBitCast(GEP, CapturedVars[Idx]->getType());
       Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, Bitcast);
-      // TODO: Runtime expects values in Int64 type, fix with arguments in struct.
+      // TODO: Runtime expects values in Int64 type, fix with arguments in
+      // struct.
       AllocaInst *TmpInt64 = OMPBuilder.Builder.CreateAlloca(
           OMPBuilder.Int64, nullptr, "fpriv.byval");
-      Value *Cast =
-          OMPBuilder.Builder.CreateBitCast(TmpInt64, CapturedVars[Idx]->getType());
+      Value *Cast = OMPBuilder.Builder.CreateBitCast(
+          TmpInt64, CapturedVars[Idx]->getType());
       OMPBuilder.Builder.CreateStore(Load, Cast);
-      Value *ConvLoad = OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, TmpInt64);
+      Value *ConvLoad =
+          OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, TmpInt64);
       OutlinedFnArgs.push_back(ConvLoad);
 
       continue;
@@ -859,8 +863,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
       OMPBuilder.Builder.CreateStore(Bitcast, GEP);
     } else {
       Type *AllocTy = CapturedVars[Idx]->getType()->getPointerElementType();
-      Value *Size = ConstantInt::get(OMPBuilder.SizeTy,
-                            M.getDataLayout().getTypeAllocSize(AllocTy));
+      Value *Size = ConstantInt::get(
+          OMPBuilder.SizeTy, M.getDataLayout().getTypeAllocSize(AllocTy));
       CallBase *GlobalAlloc =
           OMPBuilder.Builder.CreateCall(KmpcAllocShared, {Size});
       GlobalAlloc->addRetAttr(
@@ -1012,10 +1016,14 @@ void CGIntrinsicsOpenMP::emitOMPFor(DSAValueMapTy &DSAValueMap,
   OMPBuilder.Builder.restoreIP(AllocaIP);
   Value *PLastIter =
       OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, "omp.for.is_last");
-  //Value *PStart = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.start");
-  Value *PLowerBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.lb");
-  Value *PStride = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.stride");
-  Value *PUpperBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.ub");
+  // Value *PStart = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr,
+  // "omp.for.start");
+  Value *PLowerBound =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.lb");
+  Value *PStride =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.stride");
+  Value *PUpperBound =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.for.ub");
 
   OpenMPIRBuilder::OutlineInfo OI;
   OI.EntryBB = PreHeader;
@@ -1177,11 +1185,14 @@ void CGIntrinsicsOpenMP::emitOMPFor(DSAValueMapTy &DSAValueMap,
 
       BasicBlock *InsertBB = CodeGenIP.getBlock();
 
-      BasicBlock *LastPrivCond = SplitBlock(InsertBB, InsertBB->getTerminator());
+      BasicBlock *LastPrivCond =
+          SplitBlock(InsertBB, InsertBB->getTerminator());
       LastPrivCond->setName("omp.for.lastpriv.cond");
-      BasicBlock *LastPrivThen = SplitBlock(LastPrivCond, LastPrivCond->getTerminator());
+      BasicBlock *LastPrivThen =
+          SplitBlock(LastPrivCond, LastPrivCond->getTerminator());
       LastPrivThen->setName("omp.for.lastpriv.then");
-      BasicBlock *LastPrivEnd = SplitBlock(LastPrivThen, LastPrivThen->getTerminator());
+      BasicBlock *LastPrivEnd =
+          SplitBlock(LastPrivThen, LastPrivThen->getTerminator());
       LastPrivEnd->setName("omp.for.lastpriv.end");
       OMPBuilder.Builder.SetInsertPoint(LastPrivThen->getTerminator());
       Value *Load = OMPBuilder.Builder.CreateLoad(VTy, ReplacementValue);
@@ -1193,8 +1204,10 @@ void CGIntrinsicsOpenMP::emitOMPFor(DSAValueMapTy &DSAValueMap,
 
       LastPrivCond->getTerminator()->eraseFromParent();
       OMPBuilder.Builder.SetInsertPoint(LastPrivCond);
-      Value *PLastIterLoad = OMPBuilder.Builder.CreateLoad(OMPBuilder.Int32, PLastIter);
-      Value *Cond = OMPBuilder.Builder.CreateICmpNE(PLastIterLoad, ConstantInt::get(OMPBuilder.Int32, 0));
+      Value *PLastIterLoad =
+          OMPBuilder.Builder.CreateLoad(OMPBuilder.Int32, PLastIter);
+      Value *Cond = OMPBuilder.Builder.CreateICmpNE(
+          PLastIterLoad, ConstantInt::get(OMPBuilder.Int32, 0));
       OMPBuilder.Builder.CreateCondBr(Cond, LastPrivThen, LastPrivEnd);
     }
   };
@@ -1223,10 +1236,9 @@ void CGIntrinsicsOpenMP::emitOMPFor(DSAValueMapTy &DSAValueMap,
     report_fatal_error("Verification of omp for lowering failed!");
 }
 
-void CGIntrinsicsOpenMP::emitOMPTask(DSAValueMapTy &DSAValueMap,
-                                     Function *Fn, BasicBlock *BBEntry,
-                                     BasicBlock *StartBB, BasicBlock *EndBB,
-                                     BasicBlock *AfterBB) {
+void CGIntrinsicsOpenMP::emitOMPTask(DSAValueMapTy &DSAValueMap, Function *Fn,
+                                     BasicBlock *BBEntry, BasicBlock *StartBB,
+                                     BasicBlock *EndBB, BasicBlock *AfterBB) {
   // Define types.
   // ************** START TYPE DEFINITION ************** //
   enum {
@@ -1256,7 +1268,8 @@ void CGIntrinsicsOpenMP::emitOMPTask(DSAValueMapTy &DSAValueMap,
     Value *OriginalValue = It.first;
     if (It.second.Type == DSA_SHARED)
       SharedsTy.push_back(OriginalValue->getType());
-    else if (It.second.Type == DSA_PRIVATE || It.second.Type == DSA_FIRSTPRIVATE) {
+    else if (It.second.Type == DSA_PRIVATE ||
+             It.second.Type == DSA_FIRSTPRIVATE) {
       assert(isa<PointerType>(OriginalValue->getType()) &&
              "Expected private, firstprivate value with pointer type");
       // Store a copy of the value, thus get the pointer element type.
@@ -1369,8 +1382,7 @@ void CGIntrinsicsOpenMP::emitOMPTask(DSAValueMapTy &DSAValueMap,
         if (CopyConstructor) {
           Value *Copy = OMPBuilder.Builder.CreateCall(CopyConstructor, {Load});
           OMPBuilder.Builder.CreateStore(Copy, FirstprivateGEP);
-        }
-        else
+        } else
           OMPBuilder.Builder.CreateStore(Load, FirstprivateGEP);
         ++PrivatesGEPIdx;
       } else if (DSA == DSA_PRIVATE)
@@ -1742,8 +1754,7 @@ void CGIntrinsicsOpenMP::emitOMPOffloadingMappings(
       OffloadMapNames, OMPBuilder.Int8Ptr, OMPBuilder.VoidPtrPtr,
       ".offload_mapnames");
 
-  auto EmitArrayAlloca = [&](size_t Size, Type *Ty,
-                                                      StringRef Name) {
+  auto EmitArrayAlloca = [&](size_t Size, Type *Ty, StringRef Name) {
     InsertPointTy CodeGenIP = OMPBuilder.Builder.saveIP();
 
     OMPBuilder.Builder.restoreIP(AllocaIP);
@@ -2044,12 +2055,13 @@ CGIntrinsicsOpenMP::emitOffloadingGlobals(StringRef DevWrapperFuncName,
   return OMPRegionId;
 }
 
-void CGIntrinsicsOpenMP::emitOMPTarget(
-    Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
-    DSAValueMapTy &DSAValueMap,
-    StructMapTy &StructMappingInfoMap,
-    TargetInfoStruct &TargetInfo, OMPLoopInfoStruct *OMPLoopInfo,
-    bool IsDeviceTargetRegion) {
+void CGIntrinsicsOpenMP::emitOMPTarget(Function *Fn, BasicBlock *EntryBB,
+                                       BasicBlock *StartBB, BasicBlock *EndBB,
+                                       DSAValueMapTy &DSAValueMap,
+                                       StructMapTy &StructMappingInfoMap,
+                                       TargetInfoStruct &TargetInfo,
+                                       OMPLoopInfoStruct *OMPLoopInfo,
+                                       bool IsDeviceTargetRegion) {
   if (IsDeviceTargetRegion)
     emitOMPTargetDevice(Fn, EntryBB, StartBB, EndBB, DSAValueMap,
                         StructMappingInfoMap, TargetInfo);
@@ -2060,8 +2072,7 @@ void CGIntrinsicsOpenMP::emitOMPTarget(
 
 void CGIntrinsicsOpenMP::emitOMPTargetHost(
     Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
-    DSAValueMapTy &DSAValueMap,
-    StructMapTy &StructMappingInfoMap,
+    DSAValueMapTy &DSAValueMap, StructMapTy &StructMappingInfoMap,
     TargetInfoStruct &TargetInfo, OMPLoopInfoStruct *OMPLoopInfo) {
 
   Twine DevWrapperFuncName = getDevWrapperFuncPrefix() + TargetInfo.DevFuncName;
@@ -2096,7 +2107,6 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
                          Fn->getEntryBlock().getFirstInsertionPt());
   emitOMPOffloadingMappings(AllocaIP, DSAValueMap, StructMappingInfoMap,
                             OffloadingMappingArgs, /* isTargetRegion */ true);
-
 
   // Push the tripcount.
   if (OMPLoopInfo) {
@@ -2145,11 +2155,12 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
   EntryBB->getTerminator()->eraseFromParent();
 }
 
-void CGIntrinsicsOpenMP::emitOMPTargetDevice(
-    Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
-    DSAValueMapTy &DSAValueMap,
-    StructMapTy &StructMappingInfoMap,
-    TargetInfoStruct &TargetInfo) {
+void CGIntrinsicsOpenMP::emitOMPTargetDevice(Function *Fn, BasicBlock *EntryBB,
+                                             BasicBlock *StartBB,
+                                             BasicBlock *EndBB,
+                                             DSAValueMapTy &DSAValueMap,
+                                             StructMapTy &StructMappingInfoMap,
+                                             TargetInfoStruct &TargetInfo) {
   // Emit the Numba wrapper offloading function.
   SmallVector<Type *, 8> WrapperArgsTypes;
   SmallVector<StringRef, 8> WrapperArgsNames;
@@ -2172,9 +2183,9 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
     }
   }
 
-  for(auto &Arg : WrapperArgsNames)
+  for (auto &Arg : WrapperArgsNames)
     LLVM_DEBUG(dbgs() << "[IOMP] Adding wrapper arg " << Arg << "\n");
-  for(auto &Arg : WrapperArgsTypes) {
+  for (auto &Arg : WrapperArgsTypes) {
     LLVM_DEBUG(dbgs() << "[IOMP] Arg type ");
     LLVM_DEBUG(Arg->print(dbgs()));
     LLVM_DEBUG(dbgs() << "\n");
@@ -2256,9 +2267,9 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(
 }
 
 void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
-    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap,
-    const DebugLoc &DL, Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB,
-    BasicBlock *EndBB, BasicBlock *AfterBB, TeamsInfoStruct &TeamsInfo) {
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL,
+    Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+    BasicBlock *AfterBB, TeamsInfoStruct &TeamsInfo) {
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn =
       createOutlinedFunction(DSAValueMap, VMap, Fn, StartBB, EndBB,
@@ -2280,8 +2291,8 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
   assert(ThreadID && "Expected non-null ThreadID");
 
   // Create global_tid, bound_tid (zero) to pass to the teams outlined function.
-  AllocaInst *ThreadIDAddr =
-      OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, ".threadid.addr");
+  AllocaInst *ThreadIDAddr = OMPBuilder.Builder.CreateAlloca(
+      OMPBuilder.Int32, nullptr, ".threadid.addr");
   AllocaInst *ZeroAddr =
       OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int32, nullptr, ".zero.addr");
   OMPBuilder.Builder.CreateStore(ThreadID, ThreadIDAddr);
@@ -2300,15 +2311,17 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
             ->getPointerElementType()
             ->isSingleValueType()) {
       Type *VPtrElemTy = CapturedVars[Idx]->getType()->getPointerElementType();
-      Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, CapturedVars[Idx]);
+      Value *Load =
+          OMPBuilder.Builder.CreateLoad(VPtrElemTy, CapturedVars[Idx]);
       // TODO: Runtime expects values in Int64 type, fix with arguments in
       // struct.
       AllocaInst *TmpInt64 = OMPBuilder.Builder.CreateAlloca(
           OMPBuilder.Int64, nullptr, "fpriv.byval");
-      Value *Cast =
-          OMPBuilder.Builder.CreateBitCast(TmpInt64, CapturedVars[Idx]->getType());
+      Value *Cast = OMPBuilder.Builder.CreateBitCast(
+          TmpInt64, CapturedVars[Idx]->getType());
       OMPBuilder.Builder.CreateStore(Load, Cast);
-      Value *ConvLoad = OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, TmpInt64);
+      Value *ConvLoad =
+          OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, TmpInt64);
       Args.push_back(ConvLoad);
 
       continue;
@@ -2338,16 +2351,14 @@ void CGIntrinsicsOpenMP::emitOMPTeams(DSAValueMapTy &DSAValueMap,
     emitOMPTeamsDeviceRuntime(DSAValueMap, VMap, DL, Fn, BBEntry, StartBB,
                               EndBB, AfterBB, TeamsInfo);
   else
-    emitOMPTeamsHostRuntime(DSAValueMap, VMap, DL, Fn, BBEntry, StartBB,
-                            EndBB, AfterBB, TeamsInfo);
+    emitOMPTeamsHostRuntime(DSAValueMap, VMap, DL, Fn, BBEntry, StartBB, EndBB,
+                            AfterBB, TeamsInfo);
 }
 
-void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
-                                      ValueToValueMapTy *VMap,
-                                      const DebugLoc &DL, Function *Fn,
-                                      BasicBlock *BBEntry, BasicBlock *StartBB,
-                                      BasicBlock *EndBB, BasicBlock *AfterBB,
-                                      TeamsInfoStruct &TeamsInfo) {
+void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL,
+    Function *Fn, BasicBlock *BBEntry, BasicBlock *StartBB, BasicBlock *EndBB,
+    BasicBlock *AfterBB, TeamsInfoStruct &TeamsInfo) {
   SmallVector<Value *, 16> CapturedVars;
   Function *OutlinedFn = createOutlinedFunction(
       DSAValueMap, /*ValueToValueMapTy */ VMap, Fn, StartBB, EndBB,
@@ -2392,15 +2403,16 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
                OMPBuilder.Builder.CreateBitCast(OutlinedFn,
                                                 OMPBuilder.ParallelTaskPtr)});
 
-    for (size_t Idx = 0; Idx < CapturedVars.size(); ++Idx) {
-      // Pass firstprivate scalar by value.
+  for (size_t Idx = 0; Idx < CapturedVars.size(); ++Idx) {
+    // Pass firstprivate scalar by value.
     if (DSAValueMap[CapturedVars[Idx]].Type == DSA_FIRSTPRIVATE &&
         CapturedVars[Idx]
             ->getType()
             ->getPointerElementType()
             ->isSingleValueType()) {
       Type *VPtrElemTy = CapturedVars[Idx]->getType()->getPointerElementType();
-      Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, CapturedVars[Idx]);
+      Value *Load =
+          OMPBuilder.Builder.CreateLoad(VPtrElemTy, CapturedVars[Idx]);
       Args.push_back(Load);
 
       continue;
@@ -2422,8 +2434,7 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(DSAValueMapTy &DSAValueMap,
 
 void CGIntrinsicsOpenMP::emitOMPTargetEnterData(
     Function *Fn, BasicBlock *BBEntry, DSAValueMapTy &DSAValueMap,
-    StructMapTy
-        &StructMappingInfoMap) {
+    StructMapTy &StructMappingInfoMap) {
 
   const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
   OpenMPIRBuilder::LocationDescription Loc(
@@ -2433,8 +2444,8 @@ void CGIntrinsicsOpenMP::emitOMPTargetEnterData(
   Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc, SrcLocStrSize);
   Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr, SrcLocStrSize);
 
-  FunctionCallee TargetDataBeginMapper =
-      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_data_begin_mapper);
+  FunctionCallee TargetDataBeginMapper = OMPBuilder.getOrCreateRuntimeFunction(
+      M, OMPRTL___tgt_target_data_begin_mapper);
   OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
 
   // Emit mappings.
@@ -2457,8 +2468,7 @@ void CGIntrinsicsOpenMP::emitOMPTargetEnterData(
 
 void CGIntrinsicsOpenMP::emitOMPTargetExitData(
     Function *Fn, BasicBlock *BBEntry, DSAValueMapTy &DSAValueMap,
-    StructMapTy
-        &StructMappingInfoMap) {
+    StructMapTy &StructMappingInfoMap) {
 
   const DebugLoc DL = BBEntry->getTerminator()->getDebugLoc();
   OpenMPIRBuilder::LocationDescription Loc(
@@ -2468,8 +2478,8 @@ void CGIntrinsicsOpenMP::emitOMPTargetExitData(
   Constant *SrcLocStr = OMPBuilder.getOrCreateSrcLocStr(Loc, SrcLocStrSize);
   Value *SrcLoc = OMPBuilder.getOrCreateIdent(SrcLocStr, SrcLocStrSize);
 
-  FunctionCallee TargetDataEndMapper =
-      OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___tgt_target_data_end_mapper);
+  FunctionCallee TargetDataEndMapper = OMPBuilder.getOrCreateRuntimeFunction(
+      M, OMPRTL___tgt_target_data_end_mapper);
   OMPBuilder.Builder.SetInsertPoint(BBEntry->getTerminator());
 
   // Emit mappings.
@@ -2532,9 +2542,11 @@ void CGIntrinsicsOpenMP::emitOMPTargetUpdate(
        Constant::getNullValue(OMPBuilder.VoidPtrPtr)});
 }
 
-void CGIntrinsicsOpenMP::emitOMPDistribute(
-    DSAValueMapTy &DSAValueMap, BasicBlock *StartBB,
-    BasicBlock *ExitBB, OMPLoopInfoStruct &OMPLoopInfo, bool IsStandalone) {
+void CGIntrinsicsOpenMP::emitOMPDistribute(DSAValueMapTy &DSAValueMap,
+                                           BasicBlock *StartBB,
+                                           BasicBlock *ExitBB,
+                                           OMPLoopInfoStruct &OMPLoopInfo,
+                                           bool IsStandalone) {
   // TODO: de-duplicate code, there is large overlap with omp for code
   // generation.
   LLVM_DEBUG(dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n");
@@ -2545,7 +2557,8 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(
   BasicBlock *PreHeader = StartBB;
   BasicBlock *LoopHeader = PreHeader->getUniqueSuccessor();
   BasicBlock *LoopExit = ExitBB;
-  assert(LoopHeader && "Expected unique successor from PreHeader to LoopHeader");
+  assert(LoopHeader &&
+         "Expected unique successor from PreHeader to LoopHeader");
   LLVM_DEBUG(dbgs() << "=== PreHeader\n"
                     << *PreHeader << "=== End of PreHeader\n");
   LLVM_DEBUG(dbgs() << "=== LoopHeader\n"
@@ -2570,11 +2583,14 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(
   InsertPointTy AllocaIP(PreHeader, PreHeader->getFirstInsertionPt());
   Type *I32Type = Type::getInt32Ty(M.getContext());
   OMPBuilder.Builder.restoreIP(AllocaIP);
-  Value *PLastIter =
-      OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, "omp.distribute.is_last");
-  Value *PLowerBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.lb");
-  Value *PStride = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.stride");
-  Value *PUpperBound = OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.ub");
+  Value *PLastIter = OMPBuilder.Builder.CreateAlloca(I32Type, nullptr,
+                                                     "omp.distribute.is_last");
+  Value *PLowerBound =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.lb");
+  Value *PStride =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.stride");
+  Value *PUpperBound =
+      OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.ub");
 
   OpenMPIRBuilder::OutlineInfo OI;
   OI.EntryBB = PreHeader;
@@ -2618,9 +2634,8 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(
         if (CopyConstructor) {
           Value *Copy = OMPBuilder.Builder.CreateCall(CopyConstructor, {V});
           OMPBuilder.Builder.CreateStore(Copy, ReplacementValue);
-        }
-        else
-        OMPBuilder.Builder.CreateStore(V, ReplacementValue);
+        } else
+          OMPBuilder.Builder.CreateStore(V, ReplacementValue);
       } else
         report_fatal_error("Unsupported privatization");
 
@@ -2670,8 +2685,8 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(
   OMPBuilder.Builder.CreateStore(LoadPUpperBound, OMPLoopInfo.UB);
   // Add lower bound to IV.
   Value *LowerBound = OMPBuilder.Builder.CreateLoad(IVTy, PLowerBound);
-  //Value *LoadIV = OMPBuilder.Builder.CreateLoad(IVTy, OMPLoopInfo.IV);
-  //Value *UpdateIV = OMPBuilder.Builder.CreateAdd(LoadIV, LowerBound);
+  // Value *LoadIV = OMPBuilder.Builder.CreateLoad(IVTy, OMPLoopInfo.IV);
+  // Value *UpdateIV = OMPBuilder.Builder.CreateAdd(LoadIV, LowerBound);
   OMPBuilder.Builder.CreateStore(LowerBound, OMPLoopInfo.IV);
 
   // Add fini call after the loop exit block.
@@ -2685,9 +2700,9 @@ void CGIntrinsicsOpenMP::emitOMPDistribute(
 }
 
 void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
-    DSAValueMapTy &DSAValueMap, BasicBlock *StartBB,
-    BasicBlock *ExitBB, OMPLoopInfoStruct &OMPLoopInfo,
-    ParRegionInfoStruct &ParRegionInfo, bool IsStandalone) {
+    DSAValueMapTy &DSAValueMap, BasicBlock *StartBB, BasicBlock *ExitBB,
+    OMPLoopInfoStruct &OMPLoopInfo, ParRegionInfoStruct &ParRegionInfo,
+    bool IsStandalone) {
 
   LLVM_DEBUG(dbgs() << "OMPLoopInfo.IV " << *OMPLoopInfo.IV << "\n");
   LLVM_DEBUG(dbgs() << "OMPLoopInfo.Start " << *OMPLoopInfo.Start << "\n");
@@ -2736,8 +2751,7 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
   BasicBlock *ForBegin =
       SplitBlock(ForEntry, &*ForEntry->getFirstInsertionPt());
   ForBegin->setName("omp.inner.for.begin");
-  BasicBlock *CondTrue =
-      SplitBlock(PreHeader, PreHeader->getTerminator());
+  BasicBlock *CondTrue = SplitBlock(PreHeader, PreHeader->getTerminator());
   CondTrue->setName("omp.distribute.min.ub");
   BasicBlock *DistributePreheader =
       SplitBlock(CondTrue, CondTrue->getTerminator());
@@ -2751,8 +2765,7 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
   ForEnd->setName("omp.inner.for.end");
   BasicBlock *ForExit = SplitBlock(ForEnd, ForEnd->getTerminator());
   ForExit->setName("omp.inner.for.exit");
-  BasicBlock *DistributeInc =
-      SplitBlock(ForExit, ForExit->getTerminator());
+  BasicBlock *DistributeInc = SplitBlock(ForExit, ForExit->getTerminator());
   DistributeInc->setName("omp.distribute.inc");
   BasicBlock *DistributeExit =
       SplitBlock(DistributeInc, DistributeInc->getTerminator());
@@ -2768,8 +2781,8 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
   OMPBuilder.Builder.restoreIP(AllocaIP);
   Value *PDistributeIV =
       OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.iv");
-  Value *PLastIter =
-      OMPBuilder.Builder.CreateAlloca(I32Type, nullptr, "omp.distribute.is_last");
+  Value *PLastIter = OMPBuilder.Builder.CreateAlloca(I32Type, nullptr,
+                                                     "omp.distribute.is_last");
   Value *PStride =
       OMPBuilder.Builder.CreateAlloca(IVTy, nullptr, "omp.distribute.stride");
 
@@ -2822,11 +2835,9 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
 
   OMPBuilder.Builder.SetInsertPoint(PreHeader->getTerminator());
   // Store the start and initial normalized upper bound to PUpperBound.
-  Value *LoadStart =
-      OMPBuilder.Builder.CreateLoad(IVTy, OMPLoopInfo.Start);
+  Value *LoadStart = OMPBuilder.Builder.CreateLoad(IVTy, OMPLoopInfo.Start);
   OMPBuilder.Builder.CreateStore(LoadStart, PStart);
-  Value *LoadUB =
-      OMPBuilder.Builder.CreateLoad(IVTy, OMPLoopInfo.UB);
+  Value *LoadUB = OMPBuilder.Builder.CreateLoad(IVTy, OMPLoopInfo.UB);
   OMPBuilder.Builder.CreateStore(LoadUB, PUpperBound);
 
   Constant *Zero = ConstantInt::get(IVTy, 0);
@@ -2850,8 +2861,8 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
       OMPLoopInfo.Chunk = One;
     }
   }
-  Value *ChunkCast =
-      OMPBuilder.Builder.CreateIntCast(OMPLoopInfo.Chunk, IVTy, /*isSigned*/ false);
+  Value *ChunkCast = OMPBuilder.Builder.CreateIntCast(OMPLoopInfo.Chunk, IVTy,
+                                                      /*isSigned*/ false);
 
   Value *ThreadNum = OMPBuilder.getOrCreateThreadID(SrcLoc);
 
@@ -2910,7 +2921,7 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
                     << "=== End Distribute DistributeParallelFor\n");
   // TODO: Privatization runs by parallel for codegen.
   // Run the privatizer last to update values in the whole generated code.
-  //if (IsStandalone)
+  // if (IsStandalone)
   //  Privatizer();
 
   // Emit parallel for.
@@ -2978,7 +2989,8 @@ void CGIntrinsicsOpenMP::emitOMPDistributeParallelFor(
   DSAValueMap.erase(PUpperBound);
 
   if (verifyFunction(*Fn, &errs()))
-    report_fatal_error("Verification of DistributeParallelFor lowering failed!");
+    report_fatal_error(
+        "Verification of DistributeParallelFor lowering failed!");
 
   LLVM_DEBUG(dbgs() << "=== Dump DistributeParallelFor\n"
                     << *PreHeader->getParent()
@@ -2990,14 +3002,13 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
     BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     BasicBlock *ExitBB, BasicBlock *AfterBB, OMPLoopInfoStruct &OMPLoopInfo,
     ParRegionInfoStruct &ParRegionInfo, TargetInfoStruct &TargetInfo,
-    StructMapTy &StructMappingInfoMap,
-    bool IsDeviceTargetRegion) {
+    StructMapTy &StructMappingInfoMap, bool IsDeviceTargetRegion) {
   emitOMPDistributeParallelFor(DSAValueMap, StartBB, ExitBB, OMPLoopInfo,
                                ParRegionInfo,
                                /* isStandalone */ false);
   // Lower target_teams.
-  emitOMPTargetTeams(DSAValueMap, nullptr, DL, Fn, EntryBB, StartBB, EndBB, AfterBB,
-                     TargetInfo, &OMPLoopInfo, StructMappingInfoMap,
+  emitOMPTargetTeams(DSAValueMap, nullptr, DL, Fn, EntryBB, StartBB, EndBB,
+                     AfterBB, TargetInfo, &OMPLoopInfo, StructMappingInfoMap,
                      IsDeviceTargetRegion);
 
   // Alternative codegen, starting from top-down and renaming values using the
@@ -3045,18 +3056,17 @@ void CGIntrinsicsOpenMP::emitOMPTargetTeamsDistributeParallelFor(
 }
 
 void CGIntrinsicsOpenMP::emitOMPTargetTeams(
-    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL, Function *Fn,
-    BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
+    DSAValueMapTy &DSAValueMap, ValueToValueMapTy *VMap, const DebugLoc &DL,
+    Function *Fn, BasicBlock *EntryBB, BasicBlock *StartBB, BasicBlock *EndBB,
     BasicBlock *AfterBB, TargetInfoStruct &TargetInfo,
-    OMPLoopInfoStruct *OMPLoopInfo,
-    StructMapTy &StructMappingInfoMap,
+    OMPLoopInfoStruct *OMPLoopInfo, StructMapTy &StructMappingInfoMap,
     bool IsDeviceTargetRegion) {
 
   BasicBlock *TeamsEntryBB = SplitBlock(EntryBB, EntryBB->getTerminator());
   TeamsEntryBB->setName("omp.teams.entry");
   BasicBlock *TeamsStartBB =
-      splitBlockBefore(StartBB, &*StartBB->getFirstInsertionPt(), nullptr, nullptr,
-                       nullptr, "omp.teams.start");
+      splitBlockBefore(StartBB, &*StartBB->getFirstInsertionPt(), nullptr,
+                       nullptr, nullptr, "omp.teams.start");
   BasicBlock *TeamsEndBB =
       splitBlockBefore(EndBB, &*EndBB->getFirstInsertionPt(), nullptr, nullptr,
                        nullptr, "omp.teams.end");

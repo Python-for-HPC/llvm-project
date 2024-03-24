@@ -1,4 +1,5 @@
-//===- IntrinsicsOpenMP.cpp - Codegen OpenMP from IR intrinsics --------------===//
+//===- IntrinsicsOpenMP.cpp - Codegen OpenMP from IR intrinsics
+//--------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -29,6 +30,7 @@
 #include "llvm/Transforms/IntrinsicsOpenMP/IntrinsicsOpenMP.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <memory>
 
 using namespace llvm;
 using namespace omp;
@@ -60,9 +62,8 @@ public:
   const DirectiveRegion *getParent() { return Parent; }
 
   static DirectiveRegion *create(CallBase *CBEntry, CallBase *CBExit) {
-    DirectiveRegion DR{CBEntry, CBExit};
-    DirectiveRegions.emplace_back(DR);
-    return &DirectiveRegions.back();
+    DirectiveRegion *DR = new DirectiveRegion(CBEntry, CBExit);
+    return DR;
   }
 
 private:
@@ -73,12 +74,10 @@ private:
 
   DirectiveRegion(CallBase *CBEntry, CallBase *CBExit)
       : CBEntry(CBEntry), CBExit(CBExit), Parent(this) {}
-  static SmallVector<DirectiveRegion, 8> DirectiveRegions;
-  };
+};
 
-SmallVector<DirectiveRegion, 8> DirectiveRegion::DirectiveRegions{};
-
-static SmallVector<Value *> collectGlobalizedValues(DirectiveRegion &Directive) {
+static SmallVector<Value *>
+collectGlobalizedValues(DirectiveRegion &Directive) {
 
   SmallVector<Value *> GlobalizedValues;
 
@@ -131,9 +130,10 @@ struct IntrinsicsOpenMP : public ModulePass {
 
     CGIntrinsicsOpenMP CGIOMP(M);
     // Find all calls to directive intrinsics.
-    DenseMap<Function *, SmallVector<DirectiveRegion *, 4>> FunctionToDirectives;
+    DenseMap<Function *, SmallVector<DirectiveRegion *, 4>>
+        FunctionToDirectives;
 
-    for(User *Usr : RegionEntryF->users()) {
+    for (User *Usr : RegionEntryF->users()) {
       CallBase *CBEntry = dyn_cast<CallBase>(Usr);
       assert(CBEntry && "Expected call to directive entry");
       assert(CBEntry->getNumUses() == 1 &&
@@ -210,7 +210,8 @@ struct IntrinsicsOpenMP : public ModulePass {
                 DT.dominates(DR->getExit(), Outer->getExit())))
             continue;
 
-          // DR is inside the outer region, find where to put it in the DirectiveList.
+          // DR is inside the outer region, find where to put it in the
+          // DirectiveList.
           auto InsertIt = DirectiveList.end();
           for (auto It = DirectiveList.begin(), End = DirectiveList.end();
                It != End; ++It) {
@@ -227,7 +228,7 @@ struct IntrinsicsOpenMP : public ModulePass {
           break;
         }
 
-        if(!Inserted)
+        if (!Inserted)
           DirectiveListVector.push_back(std::list<DirectiveRegion *>{DR});
       }
 
@@ -240,10 +241,11 @@ struct IntrinsicsOpenMP : public ModulePass {
     }
 
     // Iterate all directive lists and codegen.
-    for (auto &DirectiveList: DirectiveListVector) {
+    for (auto &DirectiveList : DirectiveListVector) {
       // If the outermost directive is a TARGET directive, collect globalized
       // values to set for codegen.
-      // TODO: implement Directives as a class, parse each directive before codegen.
+      // TODO: implement Directives as a class, parse each directive before
+      // codegen.
       auto *Outer = DirectiveList.front();
       if (Outer->getEntry()->getOperandBundleAt(0).getTagName().contains(
               "TARGET")) {
@@ -387,15 +389,15 @@ struct IntrinsicsOpenMP : public ModulePass {
                 assert(false && "Unsupported qualifier in directive");
               }
             } else if (Tag.startswith("QUAL.OMP.NOWAIT")) {
-              switch(Dir) {
-                case OMPD_target:
-                case OMPD_target_teams:
-                case OMPD_target_teams_distribute:
-                case OMPD_target_teams_distribute_parallel_for:
-                  TargetInfo.NoWait = true;
-                  break;
-                default:
-                  assert(false && "Unsupported nowait qualifier in directive");
+              switch (Dir) {
+              case OMPD_target:
+              case OMPD_target_teams:
+              case OMPD_target_teams_distribute:
+              case OMPD_target_teams_distribute_parallel_for:
+                TargetInfo.NoWait = true;
+                break;
+              default:
+                assert(false && "Unsupported nowait qualifier in directive");
               }
             } else /* DSA Qualifiers */ {
               auto It = StringToDSA.find(Tag);
@@ -525,7 +527,7 @@ struct IntrinsicsOpenMP : public ModulePass {
             report_fatal_error("Target enter data should never appear inside a "
                                "device target region");
           CGIOMP.emitOMPTargetData(Fn, BBEntry, BBExit, DSAValueMap,
-                                        StructMappingInfoMap);
+                                   StructMappingInfoMap);
         } else if (Dir == OMPD_target_enter_data) {
           if (IsDeviceTargetRegion)
             report_fatal_error("Target enter data should never appear inside a "
