@@ -1,6 +1,8 @@
 #include "CGIntrinsicsOpenMP.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+#include "llvm/IR/Constant.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Value.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -821,10 +823,17 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
   Type *CapturedVarsAddrsTy =
       ArrayType::get(OMPBuilder.Int8Ptr, CapturedVars.size());
 
-  // TODO: Re-think allocas, move to start of outlined function entry for
-  // optimization.
+  // TODO: Re-think allocas, move to start of caller. If the caller is outlined
+  // in an outer OpenMP region, dot naming ensures captured_var_addrs is a
+  // private value, since it's only used for setting up the call to
+  // kmpc_parallel_51.
+  auto PrevIP = OMPBuilder.Builder.saveIP();
+  InsertPointTy AllocaIP(&Fn->getEntryBlock(),
+                         Fn->getEntryBlock().getFirstInsertionPt());
+  OMPBuilder.Builder.restoreIP(AllocaIP);
   Value *CapturedVarsAddrs = OMPBuilder.Builder.CreateAlloca(
-      CapturedVarsAddrsTy, nullptr, "captured_var_addrs");
+      CapturedVarsAddrsTy, nullptr, ".captured_var_addrs");
+  OMPBuilder.Builder.restoreIP(PrevIP);
 
   SmallVector<Value *> GlobalAllocas;
   for (size_t Idx = 0; Idx < CapturedVars.size(); ++Idx) {
