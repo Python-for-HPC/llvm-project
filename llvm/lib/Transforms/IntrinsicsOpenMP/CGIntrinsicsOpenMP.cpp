@@ -229,6 +229,17 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
       BasicBlock::Create(M.getContext(), ".outlined.entry", OutlinedFn);
   BasicBlock *OutlinedExitBB =
       BasicBlock::Create(M.getContext(), ".outlined.exit", OutlinedFn);
+
+  auto CreateAllocaAtEntry = [&](Type *Ty, Value *ArraySize = nullptr,
+                                 const Twine &Name = "") {
+    auto CurIP = OMPBuilder.Builder.saveIP();
+    OMPBuilder.Builder.SetInsertPoint(OutlinedEntryBB,
+                                      OutlinedEntryBB->getFirstInsertionPt());
+    Value *Alloca = OMPBuilder.Builder.CreateAlloca(Ty, nullptr, Name);
+    OMPBuilder.Builder.restoreIP(CurIP);
+    return Alloca;
+  };
+
   OMPBuilder.Builder.SetInsertPoint(OutlinedEntryBB);
 
   OutlinedFn->addParamAttr(0, Attribute::NoAlias);
@@ -253,8 +264,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     CollectUses(V, Uses);
 
     Type *VTy = V->getType()->getPointerElementType();
-    Value *ReplacementValue = OMPBuilder.Builder.CreateAlloca(
-        VTy, nullptr, V->getName() + ".private");
+    Value *ReplacementValue =
+        CreateAllocaAtEntry(VTy, nullptr, V->getName() + ".private");
     // NOTE: We need to zero-out privates because Numba reference
     // counting breaks when those privates correspond to memory-managed
     // data structures.
@@ -286,14 +297,15 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     CollectUses(V, Uses);
 
     Type *VPtrElemTy = V->getType()->getPointerElementType();
-    Value *ReplacementValue = OMPBuilder.Builder.CreateAlloca(
-        VPtrElemTy, nullptr, V->getName() + ".copy");
+    Value *ReplacementValue =
+        CreateAllocaAtEntry(VPtrElemTy, nullptr, V->getName() + ".copy");
     if (VPtrElemTy->isSingleValueType()) {
       // TODO: The OpenMP runtime expects and propagates arguments
       // typed as Int64, thus we cast byval firstprivates to Int64. Using an
       // aggregate to store arguments would avoid this peculiarity.
       // OMPBuilder.Builder.CreateStore(AI, ReplacementValue);
-      Value *Alloca = OMPBuilder.Builder.CreateAlloca(OMPBuilder.Int64);
+      Value *Alloca = CreateAllocaAtEntry(OMPBuilder.Int64);
+
       OMPBuilder.Builder.CreateStore(AI, Alloca);
       Value *BitCast = OMPBuilder.Builder.CreateBitCast(Alloca, V->getType());
       Value *Load = OMPBuilder.Builder.CreateLoad(VPtrElemTy, BitCast);
@@ -327,8 +339,8 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
 
     if (DSAValueMap[V].Type == DSA_REDUCTION_ADD) {
       Type *VTy = V->getType()->getPointerElementType();
-      Value *Priv = OMPBuilder.Builder.CreateAlloca(
-          VTy, /* ArraySize */ nullptr, V->getName() + ".red.priv");
+      Value *Priv = CreateAllocaAtEntry(VTy, /* ArraySize */ nullptr,
+                                        V->getName() + ".red.priv");
 
       // Store idempotent value based on operation and type.
       // TODO: create templated emitInitAndAppendInfo in CGReduction
