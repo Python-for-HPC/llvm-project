@@ -1,6 +1,7 @@
 #include "CGIntrinsicsOpenMP.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/IR/Constant.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/Verifier.h"
@@ -2230,6 +2231,9 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(Function *Fn, BasicBlock *EntryBB,
       BasicBlock::Create(M.getContext(), "entry", NumbaWrapperFunc));
   // Set up default arguments. Depends on the target architecture.
   FunctionCallee DevFuncCallee(Fn);
+  // Set the callee device function with internal linkage to enable
+  // optimization.
+  Fn->setLinkage(GlobalValue::InternalLinkage);
   SmallVector<Value *, 8> DevFuncArgs;
   Triple TargetTriple(M.getTargetTriple());
 
