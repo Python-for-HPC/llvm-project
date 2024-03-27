@@ -360,8 +360,11 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
         InsertPointTy(OutlinedEntryBB, OutlinedEntryBB->begin()),
         ReductionInfos);
 
-  for (auto *BB : BlockSet)
-    BB->moveAfter(&OutlinedFn->getEntryBlock());
+  // Deterministic insertion of BBs, BlockVector needs ExitBB to move to the
+  // outlined function.
+  BlockVector.push_back(OI.ExitBB);
+  for (auto *BB : BlockVector)
+    BB->moveBefore(OutlinedExitBB);
 
   LLVM_DEBUG(dbgs() << "=== Dump OutlinedFn\n"
                     << *OutlinedFn << "=== End of Dump OutlinedFn\n");

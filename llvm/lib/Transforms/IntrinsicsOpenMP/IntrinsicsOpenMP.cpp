@@ -130,7 +130,7 @@ struct IntrinsicsOpenMP : public ModulePass {
 
     CGIntrinsicsOpenMP CGIOMP(M);
     // Find all calls to directive intrinsics.
-    DenseMap<Function *, SmallVector<DirectiveRegion *, 4>>
+    SmallMapVector<Function *, SmallVector<DirectiveRegion *, 4>, 8>
         FunctionToDirectives;
 
     for (User *Usr : RegionEntryF->users()) {
@@ -153,8 +153,8 @@ struct IntrinsicsOpenMP : public ModulePass {
     // Create directive lists per function, list stores outermost to innermost.
     for (auto &FTD : FunctionToDirectives) {
       // Find the dominator tree for the function to find directive lists.
-      DominatorTree DT(*FTD.getFirst());
-      auto &DirectiveRegions = FTD.getSecond();
+      DominatorTree DT(*FTD.first);
+      auto &DirectiveRegions = FTD.second;
 
       // TODO: do we need a "tree" structure or are nesting lists enough?
 #if 0
