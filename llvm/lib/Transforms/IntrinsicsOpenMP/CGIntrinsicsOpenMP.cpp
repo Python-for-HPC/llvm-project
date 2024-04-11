@@ -125,6 +125,9 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
                         << " from DSAValueMap, will privatize\n");
       assert(V->getName().startswith(".") &&
              "Expected Numba temporary value, named starting with .");
+      if (!V->getName().startswith("."))
+        report_fatal_error(
+            "Expected Numba temporary value, named starting with .");
       Privates.push_back(V);
       continue;
     }
@@ -810,9 +813,10 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
   }
 
   FunctionCallee OutlinedFnCallee(OutlinedFn->getFunctionType(), OutlinedFn);
-  assert(
-      checkCreateCall(OMPBuilder.Builder, OutlinedFnCallee, OutlinedFnArgs) &&
-      "Expected valid call");
+
+  auto *OutlinedCI =
+      checkCreateCall(OMPBuilder.Builder, OutlinedFnCallee, OutlinedFnArgs);
+  assert(OutlinedCI && "Expected valid call");
   OMPBuilder.Builder.CreateRetVoid();
 
   if (verifyFunction(*OutlinedWrapperFn, &errs()))
@@ -953,7 +957,9 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
                                    CapturedVarAddrsBitcast,
                                    NumCapturedArgs};
 
-  assert(checkCreateCall(OMPBuilder.Builder, KmpcParallel51, Args) &&
+  auto *CallKmpcParallel51 =
+      checkCreateCall(OMPBuilder.Builder, KmpcParallel51, Args);
+  assert(CallKmpcParallel51 &&
          "Expected non-null call instr from code generation");
 
   FunctionCallee KmpcFreeShared =
@@ -962,8 +968,8 @@ void CGIntrinsicsOpenMP::emitOMPParallelDeviceRuntime(
     Type *AllocTy = GA->getType()->getPointerElementType();
     Value *Size = ConstantInt::get(OMPBuilder.SizeTy,
                                    M.getDataLayout().getTypeAllocSize(AllocTy));
-    assert(checkCreateCall(OMPBuilder.Builder, KmpcFreeShared, {GA, Size}) &&
-           "Expected valid call");
+    auto *CI = checkCreateCall(OMPBuilder.Builder, KmpcFreeShared, {GA, Size});
+    assert(CI && "Expected valid call");
   }
 
   OMPBuilder.Builder.CreateBr(AfterBB);
@@ -2142,10 +2148,10 @@ void CGIntrinsicsOpenMP::emitOMPTargetHost(
         OMPBuilder.Builder.CreateLoad(OMPBuilder.Int64, OMPLoopInfo->UB);
     Value *Tripcount = OMPBuilder.Builder.CreateAdd(
         Load, ConstantInt::get(OMPBuilder.Int64, 1));
-    assert(checkCreateCall(
-               OMPBuilder.Builder, TripcountMapper,
-               {Ident, ConstantInt::get(OMPBuilder.Int64, -1), Tripcount}) &&
-           "Expected valid call");
+    auto *CI = checkCreateCall(
+        OMPBuilder.Builder, TripcountMapper,
+        {Ident, ConstantInt::get(OMPBuilder.Int64, -1), Tripcount});
+    assert(CI && "Expected valid call");
   }
 
   Value *NumTeams = createScalarCast(TargetInfo.NumTeams, OMPBuilder.Int32);
@@ -2247,8 +2253,9 @@ void CGIntrinsicsOpenMP::emitOMPTargetDevice(Function *Fn, BasicBlock *EntryBB,
                                           /* RequiresFullRuntime */ true);
     Builder.restoreIP(IP);
   }
-  assert(checkCreateCall(Builder, DevFuncCallee, DevFuncArgs) &&
-         "Expected valid call");
+
+  auto *CI = checkCreateCall(Builder, DevFuncCallee, DevFuncArgs);
+  assert(CI && "Expected valid call");
 
   if (isOpenMPDeviceRuntime()) {
     OpenMPIRBuilder::LocationDescription Loc(Builder);
@@ -2357,8 +2364,8 @@ void CGIntrinsicsOpenMP::emitOMPTeamsDeviceRuntime(
     Args.push_back(CapturedVars[Idx]);
   }
 
-  assert(checkCreateCall(OMPBuilder.Builder, TeamsOutlinedFn, Args) &&
-         "Expected valid call");
+  auto *CI = checkCreateCall(OMPBuilder.Builder, TeamsOutlinedFn, Args);
+  assert(CI && "Expected valid call");
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 
@@ -2417,9 +2424,9 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(
              : Constant::getNullValue(OMPBuilder.Int32));
     FunctionCallee KmpcPushNumTeams =
         OMPBuilder.getOrCreateRuntimeFunction(M, OMPRTL___kmpc_push_num_teams);
-    assert(checkCreateCall(OMPBuilder.Builder, KmpcPushNumTeams,
-                           {Ident, ThreadID, NumTeams, ThreadLimit}) &&
-           "Expected valid call");
+    auto *CI = checkCreateCall(OMPBuilder.Builder, KmpcPushNumTeams,
+                               {Ident, ThreadID, NumTeams, ThreadLimit});
+    assert(CI && "Expected valid call");
   }
 
   FunctionCallee ForkTeams =
@@ -2448,8 +2455,8 @@ void CGIntrinsicsOpenMP::emitOMPTeamsHostRuntime(
     Args.push_back(CapturedVars[Idx]);
   }
 
-  assert(checkCreateCall(OMPBuilder.Builder, ForkTeams, Args) &&
-         "Expected valid call");
+  auto *CI = checkCreateCall(OMPBuilder.Builder, ForkTeams, Args);
+  assert(CI && "Expected valid call");
 
   OMPBuilder.Builder.CreateBr(AfterBB);
 
