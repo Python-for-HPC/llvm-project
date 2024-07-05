@@ -270,7 +270,7 @@ Function *CGIntrinsicsOpenMP::createOutlinedFunction(
     Type *VTy = V->getType()->getPointerElementType();
     Value *ReplacementValue =
         CreateAllocaAtEntry(VTy, nullptr, V->getName() + ".private");
-    // NOTE: We need to zero-out privates because Numba reference
+    // NOTE: We need to zero initialize privates because Numba reference
     // counting breaks when those privates correspond to memory-managed
     // data structures.
     OMPBuilder.Builder.CreateStore(Constant::getNullValue(VTy),
@@ -1513,6 +1513,11 @@ void CGIntrinsicsOpenMP::emitOMPTask(DSAValueMapTy &DSAValueMap, Function *Fn,
             KmpPrivatesTTy, KmpPrivatesArg, PrivatesGEPIdx,
             OriginalValue->getName() + ".task.private.gep");
         ReplacementValue = PrivateGEP;
+        // NOTE: Zero initialize private to avoid issue with Numba ref counting.
+        OMPBuilder.Builder.CreateStore(
+            Constant::getNullValue(
+                OriginalValue->getType()->getPointerElementType()),
+            ReplacementValue);
         ++PrivatesGEPIdx;
       } else if (It.second.Type == DSA_FIRSTPRIVATE) {
         Value *FirstprivateGEP = OMPBuilder.Builder.CreateStructGEP(
