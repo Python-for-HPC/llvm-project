@@ -14,7 +14,10 @@
 
 #include "llvm-c/Transforms/IntrinsicsOpenMP.h"
 #include "CGIntrinsicsOpenMP.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/Frontend/OpenMP/OMP.h.inc"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
@@ -25,11 +28,13 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/IntrinsicsOpenMP/IntrinsicsOpenMP.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <algorithm>
 #include <memory>
 
 using namespace llvm;
@@ -43,27 +48,36 @@ STATISTIC(NumOpenMPRegions, "Counts number of OpenMP regions created");
 
 namespace {
 
+class DirectiveRegionAnalysis;
+
+class DirectiveRegion;
+SmallVector<std::unique_ptr<DirectiveRegion>, 8> DirectiveRegionStorage;
+
 class DirectiveRegion {
 public:
   DirectiveRegion() = delete;
 
-  void addNested(DirectiveRegion *DR) {
-    // TODO: add into the nest, under the innermost nested directive.
-  }
+  void addNested(DirectiveRegionAnalysis &DRA, DirectiveRegion *DR);
 
-  const SmallVector<DirectiveRegion *, 4> &getNested() { return Nested; }
+  const SmallVector<DirectiveRegion *, 4> &getNested() const { return Nested; }
 
-  CallBase *getEntry() { return CBEntry; }
+  CallBase *getEntry() const { return CBEntry; }
 
-  CallBase *getExit() { return CBExit; }
+  CallBase *getExit() const { return CBExit; }
 
   void setParent(DirectiveRegion *P) { Parent = P; }
 
-  const DirectiveRegion *getParent() { return Parent; }
+  DirectiveRegion *getParent() const { return Parent; }
+
+  StringRef getTag() const {
+    return getEntry()->getOperandBundleAt(0).getTagName();
+  }
 
   static DirectiveRegion *create(CallBase *CBEntry, CallBase *CBExit) {
-    DirectiveRegion *DR = new DirectiveRegion(CBEntry, CBExit);
-    return DR;
+    // Use global storage of unique_ptr for auto-cleanup.
+    DirectiveRegionStorage.push_back(
+        std::unique_ptr<DirectiveRegion>(new DirectiveRegion{CBEntry, CBExit}));
+    return DirectiveRegionStorage.back().get();
   }
 
 private:
@@ -73,8 +87,47 @@ private:
   SmallVector<DirectiveRegion *, 4> Nested;
 
   DirectiveRegion(CallBase *CBEntry, CallBase *CBExit)
-      : CBEntry(CBEntry), CBExit(CBExit), Parent(this) {}
+      : CBEntry(CBEntry), CBExit(CBExit), Parent(nullptr) {}
 };
+
+class DirectiveRegionAnalysis {
+public:
+  explicit DirectiveRegionAnalysis(Function &F) : DT(F), PDT(F) {}
+
+  bool directiveEncloses(DirectiveRegion *DR, DirectiveRegion *OtherDR) {
+    // Use DominatorTree for Entry and PostDominatorTree for Exit.
+    // PostDominator is effective for checking Exit when there are loops in
+    // the CFG, since dominance does not hold for graphs with cycles, but
+    // post-dominance does.
+    if (DT.dominates(DR->getEntry(), OtherDR->getEntry()) &&
+        PDT.dominates(DR->getExit(), OtherDR->getExit()))
+      return true;
+
+    return false;
+  };
+
+  bool directiveEntryDominates(DirectiveRegion *DR, DirectiveRegion *OtherDR) {
+    if (DT.dominates(DR->getEntry(), OtherDR->getEntry()))
+      return true;
+
+    return false;
+  }
+
+private:
+  DominatorTree DT;
+  PostDominatorTree PDT;
+};
+
+void DirectiveRegion::addNested(DirectiveRegionAnalysis &DRA,
+                                DirectiveRegion *DR) {
+  // Insert in topological order.
+  auto Compare = [&DRA](DirectiveRegion *DR, DirectiveRegion *OtherDR) {
+    return DRA.directiveEntryDominates(DR, OtherDR);
+  };
+
+  Nested.insert(std::upper_bound(Nested.begin(), Nested.end(), DR, Compare),
+                DR);
+}
 
 static SmallVector<Value *>
 collectGlobalizedValues(DirectiveRegion &Directive) {
@@ -149,95 +202,101 @@ struct IntrinsicsOpenMP : public ModulePass {
       FunctionToDirectives[F].push_back(DM);
     }
 
-    SmallVector<std::list<DirectiveRegion *>, 4> DirectiveListVector;
-    // Create directive lists per function, list stores outermost to innermost.
+    SmallVector<SmallVector<DirectiveRegion *, 4>, 4> DirectiveListVector;
+    // Create directive lists per function, building trees of directive nests.
+    // Each list stores directives outermost to innermost (pre-order).
     for (auto &FTD : FunctionToDirectives) {
       // Find the dominator tree for the function to find directive lists.
-      DominatorTree DT(*FTD.first);
+      Function &F = *FTD.first;
       auto &DirectiveRegions = FTD.second;
+      DirectiveRegionAnalysis DRA{F};
 
-      // TODO: do we need a "tree" structure or are nesting lists enough?
-#if 0
-      for(auto *DR: DirectiveRegions) {
-        // Skip directives for which parent is found.
-        if (DR->getParent() != DR)
-          continue;
+      // Construct directive tree nests. First, find immediate parents, then add
+      // nested children to parents.
 
-        for(auto *IDR : DirectiveRegions) {
-          if(IDR == DR)
-            continue;
-
-          // DR dominates IDR.
-          if (DT.dominates(DR->getEntry(), IDR->getEntry()) &&
-              DT.dominates(IDR->getExit(), DR->getExit())) {
-                DR->addNested(IDR);
-              }
-        }
-      }
-#endif
-
-      // First pass, sweep directive regions and form lists.
+      // Find immediate parents.
       for (auto *DR : DirectiveRegions) {
-        bool Inserted = false;
-        for (auto &DirectiveList : DirectiveListVector) {
-          auto *Outer = DirectiveList.front();
-
-          // If DR dominates the Outer directive then put it in front.
-          if (DT.dominates(DR->getEntry(), Outer->getEntry()) &&
-              DT.dominates(Outer->getExit(), DR->getExit())) {
-            // XXX: modifies the iterator, should exit loop.
-            DirectiveList.push_front(DR);
-            Inserted = true;
-            // Possibly merge with other lists now that Outer is updated to DR.
-            for (auto &OtherDirectiveList : DirectiveListVector) {
-              auto *Outer = OtherDirectiveList.front();
-              if (Outer == DR)
-                continue;
-
-              if (DT.dominates(DR->getEntry(), Outer->getEntry()) &&
-                  DT.dominates(Outer->getExit(), DR->getExit())) {
-                DirectiveList.insert(DirectiveList.end(),
-                                     OtherDirectiveList.begin(),
-                                     OtherDirectiveList.end());
-                OtherDirectiveList.clear();
-              }
-            }
-            break;
-          }
-
-          // If DR is outside the Outer, continue.
-          if (!(DT.dominates(Outer->getEntry(), DR->getEntry()) &&
-                DT.dominates(DR->getExit(), Outer->getExit())))
+        for (auto *OtherDR : DirectiveRegions) {
+          if (DR == OtherDR)
             continue;
 
-          // DR is inside the outer region, find where to put it in the
-          // DirectiveList.
-          auto InsertIt = DirectiveList.end();
-          for (auto It = DirectiveList.begin(), End = DirectiveList.end();
-               It != End; ++It) {
-            DirectiveRegion *IDR = *It;
-            // Insert it after the dominating directive.
-            if (DT.dominates(IDR->getEntry(), DR->getEntry()) &&
-                DT.dominates(DR->getExit(), IDR->getExit()))
-              InsertIt = std::next(It);
+          if (!DRA.directiveEncloses(OtherDR, DR))
+            continue;
+
+          DirectiveRegion *Parent = DR->getParent();
+          if (!Parent) {
+            DR->setParent(OtherDR);
+            continue;
           }
 
-          // XXX: Modifies the iterator, should exit loop.
-          DirectiveList.insert(InsertIt, DR);
-          Inserted = true;
-          break;
+          // If OtherDR is nested under Parent and encloses DR, then OtherDR is
+          // the immediate parent of DR.
+          if (DRA.directiveEncloses(Parent, OtherDR)) {
+            DR->setParent(OtherDR);
+            continue;
+          }
+
+          // Else, OtherDR must be enclosing Parent. It is not OtherDR's
+          // immediate parent, hence no change to OtherDR.
+          assert(DRA.directiveEncloses(OtherDR, Parent));
+        }
+      }
+      // Gather all root directives, add nested children.
+      SmallVector<DirectiveRegion *, 4> Roots;
+      for (auto *DR : DirectiveRegions) {
+        DirectiveRegion *Parent = DR->getParent();
+        if (!Parent) {
+          Roots.push_back(DR);
+          continue;
         }
 
-        if (!Inserted)
-          DirectiveListVector.push_back(std::list<DirectiveRegion *>{DR});
+        Parent->addNested(DRA, DR);
       }
 
-      // Delete empty lists.
-      DirectiveListVector.erase(
-          std::remove_if(
-              DirectiveListVector.begin(), DirectiveListVector.end(),
-              [](std::list<DirectiveRegion *> &DL) { return DL.empty(); }),
-          DirectiveListVector.end());
+      // Travese the tree and add directives (outermost to innermost)
+      // in a list.
+      for (auto *Root : Roots) {
+        SmallVector<DirectiveRegion *, 4> DirectiveList;
+
+        auto VisitNode = [&DirectiveList](DirectiveRegion *Node, int Depth,
+                                          auto &&VisitNode) -> void {
+          DirectiveList.push_back(Node);
+          for (auto *Nested : Node->getNested())
+            VisitNode(Nested, Depth + 1, VisitNode);
+        };
+
+        VisitNode(Root, 0, VisitNode);
+
+        DirectiveListVector.push_back(DirectiveList);
+
+        auto PrintTree = [&]() {
+          dbgs() << " === TREE\n";
+          auto PrintNode = [](DirectiveRegion *Node, int Depth,
+                              auto &&PrintNode) -> void {
+            if (Depth) {
+              for (int I = 0; I < Depth; ++I)
+                dbgs() << "  ";
+              dbgs() << "|_ ";
+            }
+            dbgs() << Node->getTag() << "\n";
+
+            for (auto *Nested : Node->getNested())
+              PrintNode(Nested, Depth + 1, PrintNode);
+          };
+          PrintNode(Root, 0, PrintNode);
+          dbgs() << " === END OF TREE\n";
+        };
+        LLVM_DEBUG(PrintTree());
+
+        auto PrintList = [&]() {
+          dbgs() << " === List\n";
+          for (auto *DR : DirectiveList)
+            dbgs() << DR->getTag() << " -> ";
+          dbgs() << "EOL\n";
+          dbgs() << " === End of List\n";
+        };
+        LLVM_DEBUG(PrintList());
+      }
     }
 
     // Iterate all directive lists and codegen.
@@ -245,7 +304,7 @@ struct IntrinsicsOpenMP : public ModulePass {
       // If the outermost directive is a TARGET directive, collect globalized
       // values to set for codegen.
       // TODO: implement Directives as a class, parse each directive before
-      // codegen.
+      // codegen, optimize privatization.
       auto *Outer = DirectiveList.front();
       if (Outer->getEntry()->getOperandBundleAt(0).getTagName().contains(
               "TARGET")) {
@@ -257,7 +316,7 @@ struct IntrinsicsOpenMP : public ModulePass {
       for (auto It = DirectiveList.rbegin(), E = DirectiveList.rend(); It != E;
            ++It) {
         DirectiveRegion *DR = *It;
-        LLVM_DEBUG(dbgs() << "Found Directive" << *DR->getEntry() << "\n");
+        LLVM_DEBUG(dbgs() << "Found Directive " << *DR->getEntry() << "\n");
         // Extract the directive kind and data sharing attributes of values
         // from the operand bundles of the intrinsic call.
         Directive Dir = OMPD_unknown;

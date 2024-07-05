@@ -47,6 +47,7 @@ struct DSATypeInfo {
     Type = DTI.Type;
     CopyConstructor = DTI.CopyConstructor;
   }
+  DSATypeInfo &operator=(const DSATypeInfo &DTI) = default;
 };
 
 using DSAValueMapTy = MapVector<Value *, DSATypeInfo>;
